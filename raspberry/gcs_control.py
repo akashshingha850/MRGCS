@@ -4,56 +4,46 @@ GCS Control node — lets the dashboard start/stop services on the Pi.
 
 Always running (started by systemd alongside rosbridge).
 
-Subscribes:  /gcs/cmd    std_msgs/String  {"action":"start"|"stop","service":"slam"|"camera"|"mjpeg"|"mavros"|"brain"}
-Publishes:   /gcs/status std_msgs/String  {"slam":"stopped","camera":"stopped",...}  @ 1 Hz
+Subscribes:  /gcs/cmd    std_msgs/String  {"action":"start"|"stop","service":"mavros"|"brain"|"barcode"}
+Publishes:   /gcs/status std_msgs/String  {"mavros":"stopped","brain":"running",...}  @ 1 Hz
 
 Logs per-service to ~/gcs_logs/<service>.log
+
+Environment:
+  DRONE_NS      namespace the brain / barcode nodes run in, e.g. /drone_1 for
+                bisg_isaac (their MAVROS / ZED inputs are relative names). Empty = /
+  GCS_SERVICES  comma list of the services the dashboard may start (default: all).
+                Against bisg_isaac: brain,barcode — the sim runs its own MAVROS.
 """
 
 import os, json, subprocess, signal, threading
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
 from std_msgs.msg import String
 
 SCRIPTS     = os.path.dirname(os.path.realpath(__file__))
 LOG_DIR     = os.path.expanduser('~/gcs_logs')
 ROS_DISTRO  = os.environ.get('ROS_DISTRO', 'jazzy')
 
+DRONE_NS    = os.environ.get('DRONE_NS', '')
+NS_ARGS     = ['--ros-args', '-r', f'__ns:={DRONE_NS}'] if DRONE_NS else []
+
 # ── command for each service ──────────────────────────────────────────────────
 SERVICE_CMDS = {
-    'slam': [
-        'bash', f'{SCRIPTS}/slam_launch.sh',
-    ],
-    'camera': [
-        'python3', f'{SCRIPTS}/camera_publisher.py',
-        '--ros-args',
-        '-p', 'device:=0',
-        '-p', 'topic:=/camera/forward/image_raw/compressed',
-        '-p', 'width:=640', '-p', 'height:=480',
-        '-p', 'fps:=30', '-p', 'jpeg_quality:=80',
-    ],
-    'camera2': [
-        'python3', f'{SCRIPTS}/camera_publisher.py',
-        '--ros-args',
-        '-p', 'device:=1',
-        '-p', 'topic:=/camera/down/image_raw/compressed',
-        '-p', 'width:=640', '-p', 'height:=480',
-        '-p', 'fps:=30', '-p', 'jpeg_quality:=80',
-    ],
-    'mjpeg': [
-        'python3', f'{SCRIPTS}/mjpeg_server.py',
-        '0', '8080', '640', '480', '80',
-    ],
     'mavros': [
-        'python3', f'{SCRIPTS}/mavlink_bridge.py',
+        'bash', f'{SCRIPTS}/mavros_launch.sh',
     ],
     'brain': [
-        'python3', f'{SCRIPTS}/brain_node.py',
+        'python3', f'{SCRIPTS}/brain_node.py', *NS_ARGS,
     ],
     'barcode': [
-        'python3', f'{SCRIPTS}/barcode_detector.py',
+        'python3', f'{SCRIPTS}/barcode_detector.py', *NS_ARGS,
     ],
 }
+if os.environ.get('GCS_SERVICES'):
+    _allowed = {s.strip() for s in os.environ['GCS_SERVICES'].split(',')}
+    SERVICE_CMDS = {k: v for k, v in SERVICE_CMDS.items() if k in _allowed}
 
 
 class GCSControlNode(Node):
@@ -143,11 +133,11 @@ def main():
     node = GCSControlNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):   # Ctrl+C / SIGTERM
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()   # SIGTERM may have shut the context down already
 
 
 if __name__ == '__main__':

@@ -23,16 +23,16 @@
 # Customise what starts:
 #   Edit the ExecStart line below — add/remove flags from start_all.sh.
 #   Examples:
-#     rosbridge + camera only (no SLAM):
-#       ExecStart=/bin/bash %h/drone-gcs/raspberry/start_all.sh --no-slam
+#     bisg_isaac drone namespace (MAVROS / ZED under /drone_1):
+#       ExecStart=/bin/bash %h/drone-gcs/raspberry/start_all.sh --ns /drone_1
 #     with brain node:
 #       ExecStart=/bin/bash %h/drone-gcs/raspberry/start_all.sh --brain
 #     with MAVROS on serial port:
-#       ExecStart=/bin/bash %h/drone-gcs/raspberry/start_all.sh --mavros /dev/ttyAMA0
+#       ExecStart=/bin/bash %h/drone-gcs/raspberry/start_all.sh --mavros /dev/ttyAMA10
 # ─────────────────────────────────────────────────────────────────────────────
 
 [Unit]
-Description=Drone GCS stack (rosbridge + camera + SLAM)
+Description=Drone GCS stack (rosbridge + ZED map relay)
 # Start after the network is up and an IP address has been assigned
 After=network-online.target
 Wants=network-online.target

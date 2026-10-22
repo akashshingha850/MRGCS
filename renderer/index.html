@@ -109,6 +109,26 @@
     .hdr-badge.active { background:rgba(77,159,255,.15); color:var(--accent); }
     .hdr-badge.ok     { background:rgba(61,220,132,.15); color:var(--ok); }
 
+    /* ── KINETIX ────────────────────────────────── */
+    #view-kinetix { height:calc(100vh - var(--topbar)); }
+    #view-kinetix.active { display:grid !important; grid-template-columns:300px 1fr; }
+    #kx-side { background:var(--panel); border-right:1px solid var(--border); overflow-y:auto; }
+    #kx-main { display:flex; flex-direction:column; min-width:0; min-height:0; }
+    .kx-field { display:flex; align-items:center; gap:8px; padding:5px 10px; }
+    .kx-field label { color:var(--muted); font-size:11px; width:58px; flex-shrink:0; }
+    .kx-field select, .kx-field input { flex:1; min-width:0; }
+    #kx-msg { padding:6px 10px; font-size:11px; color:var(--muted); min-height:30px; word-break:break-word; }
+    #kx-warn { display:none; margin:6px 10px; padding:6px 8px; border-radius:4px; font-size:11px;
+               color:var(--warn); border:1px solid var(--warn); background:rgba(240,165,0,.08); }
+    #kx-log { flex:1; min-height:120px; margin:0; padding:8px 10px; overflow:auto; background:#0a0e14;
+              font:11px/1.45 monospace; color:#9aa4b8; white-space:pre-wrap; }
+    #kx-runs-wrap { flex:1; min-height:0; overflow:auto; border-top:1px solid var(--border); }
+    #kx-runs { width:100%; border-collapse:collapse; font-size:11px; }
+    #kx-runs th { position:sticky; top:0; background:var(--panel); color:var(--muted); font-weight:700;
+                  text-align:left; padding:5px 8px; border-bottom:1px solid var(--border); }
+    #kx-runs td { padding:4px 8px; border-bottom:1px solid rgba(46,51,64,.5); white-space:nowrap; }
+    #kx-runs td.id { font-family:monospace; font-size:10px; }
+
     /* ── VIEWS ──────────────────────────────────── */
     .view { display:none; }
     .view.active { display:flex; flex-direction:column; }
@@ -401,6 +421,7 @@
     <button class="tab-btn"        data-view="navigation">Navigation</button>
     <button class="tab-btn"        data-view="slam">SLAM</button>
     <button class="tab-btn"        data-view="image">Image Processing</button>
+    <button class="tab-btn"        data-view="kinetix">Kinetix</button>
   </nav>
   <!-- Connection popover (toggled by clicking the URL) -->
   <div id="conn-popover">
@@ -482,16 +503,6 @@
       <div id="svc-panel">
         <div class="ph">Services</div>
         <div class="svc-row">
-          <span class="svc-dot" id="svc-dot-slam"></span>
-          <span class="svc-name">SLAM</span>
-          <button class="svc-btn" id="svc-btn-slam" onclick="toggleService('slam')">Start</button>
-        </div>
-        <div class="svc-row">
-          <span class="svc-dot" id="svc-dot-camera"></span>
-          <span class="svc-name">Camera</span>
-          <button class="svc-btn" id="svc-btn-camera" onclick="toggleService('camera')">Start</button>
-        </div>
-        <div class="svc-row">
           <span class="svc-dot" id="svc-dot-mavros"></span>
           <span class="svc-name">MAVROS</span>
           <button class="svc-btn" id="svc-btn-mavros" onclick="toggleService('mavros')">Start</button>
@@ -516,10 +527,9 @@
     <!-- Camera (top-centre — square) -->
     <div id="cam-col">
       <div class="ph">
-        <span>Cam 1 — Forward</span>
+        <span>ZED — Left</span>
         <span class="cam-sig no" id="cam1-sig">NO SIGNAL</span>
       </div>
-      <img id="cam1-img" style="flex:1;width:100%;min-height:0;display:none;object-fit:contain;background:#000">
       <canvas id="cam1" style="flex:1;width:100%;min-height:0;display:block"></canvas>
     </div>
 
@@ -620,7 +630,7 @@
 ══════════════════════════════════════════════════════ -->
 <section class="view" id="view-slam">
   <div id="slam-main">
-    <div class="ph">Occupancy Map + LiDAR Overlay</div>
+    <div class="ph">ZED Spatial Map</div>
     <canvas id="slam-canvas"></canvas>
   </div>
   <div id="slam-side">
@@ -629,24 +639,17 @@
     <div class="srow"><span class="sk">Pose X</span>       <span class="sv" id="sl-x">—</span></div>
     <div class="srow"><span class="sk">Pose Y</span>       <span class="sv" id="sl-y">—</span></div>
     <div class="srow"><span class="sk">Orientation</span>  <span class="sv" id="sl-theta">—</span></div>
-    <div class="ph" style="margin-top:4px">Point-LIO</div>
-    <div class="srow"><span class="sk">Points/scan</span>  <span class="sv" id="sl-pts">—</span></div>
-    <div class="srow"><span class="sk">Mode</span>         <span class="sv accent" id="sl-astep">3D</span></div>
-    <div class="srow"><span class="sk">TF frame</span>    <span class="sv" style="font-size:10px;font-family:monospace" id="sl-minr">camera_init</span></div>
-    <div class="srow"><span class="sk">Child frame</span> <span class="sv" style="font-size:10px;font-family:monospace" id="sl-maxr">aft_mapped</span></div>
+    <div class="ph" style="margin-top:4px">ZED Spatial Mapping</div>
+    <div class="srow"><span class="sk">Map points</span>   <span class="sv" id="sl-pts">—</span></div>
+    <div class="srow"><span class="sk">Map frame</span>   <span class="sv" style="font-size:10px;font-family:monospace" id="sl-minr">—</span></div>
+    <div class="srow"><span class="sk">Camera frame</span> <span class="sv" style="font-size:10px;font-family:monospace" id="sl-maxr">—</span></div>
     <div class="ph" style="margin-top:4px">Map · PCD</div>
-    <div class="srow"><span class="sk">Save path</span>   <span class="sv" id="sl-mw" style="font-size:10px;font-family:monospace;word-break:break-all">PCD/scans.pcd</span></div>
-    <div class="srow"><span class="sk">Hint</span>         <span class="sv" id="sl-res" style="font-size:10px;color:var(--muted)">Ctrl+C stops + saves</span></div>
-    <div style="display:none" id="sl-mh"></div>
-    <div style="display:none" id="sl-ox"></div>
-    <div style="display:none" id="sl-oy"></div>
-    <div class="ph" style="margin-top:4px">Loop Closure</div>
-    <div class="srow"><span class="sk">Closures</span>    <span class="sv ok" id="sl-lc">0</span></div>
+    <div class="srow"><span class="sk">Last saved</span>   <span class="sv" id="sl-mw" style="font-size:10px;font-family:monospace;word-break:break-all">—</span></div>
     <div class="ph" style="margin-top:4px">SLAM Controls</div>
     <div style="padding:7px 10px;display:flex;flex-direction:column;gap:5px">
       <div style="display:flex;gap:5px">
-        <button id="btn-slam-start" class="cmd-btn ok"   style="flex:1">Start</button>
-        <button id="btn-slam-pause" class="cmd-btn warn" style="flex:1">Pause</button>
+        <button id="btn-slam-start" class="cmd-btn ok"   style="flex:1">Map On</button>
+        <button id="btn-slam-pause" class="cmd-btn warn" style="flex:1">Map Off</button>
       </div>
       <button id="btn-slam-save"  class="cmd-btn accent">Save Map</button>
       <div style="display:flex;gap:5px">
@@ -719,6 +722,47 @@
     </div>
     <div class="ph" style="margin-top:4px">Volume History</div>
     <div id="vol-log-list"></div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     KINETIX — whole-room photogrammetry (kinetix_bridge.py)
+══════════════════════════════════════════════════════ -->
+<section class="view" id="view-kinetix">
+  <div id="kx-side">
+    <div class="ph">Kinetix Scan</div>
+    <div class="srow"><span class="sk">Bridge</span>  <span class="sv" id="kx-bridge">offline</span></div>
+    <div class="srow"><span class="sk">State</span>   <span class="sv" id="kx-state">—</span></div>
+    <div class="srow"><span class="sk">Run</span>     <span class="sv" id="kx-run" style="font-size:10px;font-family:monospace">—</span></div>
+    <div class="srow"><span class="sk">Elapsed</span> <span class="sv" id="kx-elapsed">—</span></div>
+    <div id="kx-warn"></div>
+
+    <div class="ph" style="margin-top:4px">New capture</div>
+    <div class="kx-field"><label>Scene</label>  <select id="kx-scene" class="cmd-input"></select></div>
+    <div class="kx-field"><label>Method</label> <select id="kx-method" class="cmd-input"></select></div>
+    <div class="kx-field"><label>Seed</label>   <input id="kx-seed" type="number" value="0" min="0" step="1" class="cmd-input"></div>
+    <div style="padding:7px 10px;display:flex;flex-direction:column;gap:5px">
+      <button id="btn-kx-run"   class="cmd-btn ok">Start scan</button>
+      <button id="btn-kx-abort" class="cmd-btn danger">Abort → return &amp; land</button>
+      <button id="btn-kx-sfm"   class="cmd-btn accent">Reconstruct latest run</button>
+    </div>
+    <div id="kx-msg"></div>
+    <div style="padding:4px 10px 10px;font-size:10px;color:var(--muted);line-height:1.5">
+      tour ≈ 5 min, roi_coverage ≈ 25 min (sim wall time). Kinetix arms, takes off in OFFBOARD and lands by itself;
+      it streams the setpoints, so don't use GOTO or the brain node meanwhile.
+    </div>
+  </div>
+  <div id="kx-main">
+    <div class="ph">Log</div>
+    <pre id="kx-log">Waiting for kinetix_bridge (/gcs/kinetix/status)…</pre>
+    <div class="ph">Recent runs</div>
+    <div id="kx-runs-wrap">
+      <table id="kx-runs">
+        <thead><tr><th>Run</th><th>Method</th><th>Frames</th><th>Stop</th><th>Coverage</th>
+          <th>Registered</th><th>Points 3D</th><th>Reproj px</th><th>ATE m</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
   </div>
 </section>
 

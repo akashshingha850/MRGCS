@@ -1,0 +1,85 @@
+# mavros-gcs compose. Run from the repo root.
+#
+#   onboard     (default)   On the drone: rosbridge :9090 + ZED map relay + gcs_control. MAVROS, brain and
+#                           barcode are started from the dashboard's Services panel, inside this container.
+#                           The ZED wrapper runs outside it (ZED SDK + CUDA); DRONE_NS = its namespace.
+#                             docker compose -f docker/compose.yaml up -d
+#                           Serial port: MAV_DEVICE=/dev/ttyAMA10 (passed through, MAVROS uses it)
+#
+#   Both serve the GCS web app: open http://<host>:8090 in any browser (GCS_WEB_PORT; 8080 is bisg's Lichtblick).
+#
+#   bisg        (profile)   The same stack joined to a running bisg_isaac sim (PX4 SITL + its MAVROS and ZED stack
+#                           under /drone_N). The sim owns MAVROS, so the dashboard can start only brain and barcode.
+#                           The GCS app finds the namespace by itself. Use docker/bisg_up.sh, which reads the sim's
+#                           ROS_DOMAIN_ID; by hand:
+#                             ROS_DOMAIN_ID=<sim domain> DRONE_NS=/drone_1 docker compose -f docker/compose.yaml --profile bisg up -d gcs-bisg
+#
+#   kinetix     (profile)   kinetix_bridge.py in the kinetix:jazzy image, with the Kinetix repo (KINETIX_DIR, default
+#                           ../../kinetix next to this repo): the GCS Kinetix tab's buttons (scan, abort → land, reconstruct).
+#                           docker/bisg_up.sh starts it when the image and the repo exist.
+#
+# Both use the host network: DDS discovery and the WebSocket port are the host's.
+name: mavros-gcs
+
+x-gcs: &gcs
+  image: mavros-gcs/onboard:jazzy
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  network_mode: host
+  ipc: host
+  init: true          # gcs_control is not an init: without one, services it stops leave zombies
+
+services:
+  onboard:
+    <<: *gcs
+    container_name: gcs-onboard
+    devices: ["${MAV_DEVICE:-/dev/null}:${MAV_DEVICE:-/dev/null}"]   # Pixhawk UART; /dev/null = none
+    group_add: ["dialout"]
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      DRONE_NS: ${DRONE_NS:-}                 # namespace of the ZED / MAVROS topics, e.g. /drone_1
+      GCS_WEB_PORT: ${GCS_WEB_PORT:-8090}
+      MAV_PORT: ${MAV_DEVICE:-}               # empty = mavros_launch.sh auto-detects
+      MAV_BAUD: ${MAV_BAUD:-57600}
+    volumes:
+      - gcs-data:/data                        # gcs_logs/, brain_data.db
+    restart: unless-stopped
+
+  gcs-bisg:
+    <<: *gcs
+    container_name: gcs-bisg
+    profiles: ["bisg"]
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:?set ROS_DOMAIN_ID to the sim's domain (docker/bisg_up.sh does)}
+      RMW_IMPLEMENTATION: rmw_cyclonedds_cpp  # bisg_isaac's containers run CycloneDDS
+      DRONE_NS: ${DRONE_NS:-/drone_1}
+      GCS_SERVICES: brain,barcode             # the sim runs its own MAVROS
+      GCS_WEB_PORT: ${GCS_WEB_PORT:-8090}
+    volumes:
+      - gcs-data:/data
+      - ../renderer:/opt/gcs/renderer:ro      # web app straight from the repo: edit, reload the page
+    restart: unless-stopped
+
+  kinetix-bridge:
+    image: kinetix:jazzy                      # Kinetix's own image (built by the Kinetix repo)
+    container_name: gcs-kinetix
+    profiles: ["kinetix"]
+    network_mode: host
+    ipc: host
+    init: true
+    user: "${KX_UID:-1000}:${KX_GID:-1000}"   # run files belong to the host user, as with Kinetix's own compose
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:?set ROS_DOMAIN_ID to the sim's domain (docker/bisg_up.sh does)}
+      CYCLONEDDS_URI: file:///kinetix/docker/cyclonedds.xml
+      DRONE_NS: ${DRONE_NS:-/drone_1}
+      HOME: /tmp
+    volumes:
+      - ${KINETIX_DIR:-../../kinetix}:/kinetix:rw
+      - ../raspberry/kinetix_bridge.py:/opt/gcs/kinetix_bridge.py:ro
+    command: ["python3", "/opt/gcs/kinetix_bridge.py"]
+    stop_grace_period: 200s                   # a stop mid-flight lands first (SIGINT to the run, up to ~3 min)
+    restart: unless-stopped
+
+volumes:
+  gcs-data:

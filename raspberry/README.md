@@ -1,26 +1,41 @@
 # raspberry/ — Onboard Software Stack
 
-All Python nodes and shell scripts that run on the **Raspberry Pi 5** aboard the drone. They form a complete ROS2 stack — no cloud, no external services needed.
+All Python nodes and shell scripts that run on the drone's companion computer (the folder name is from the Raspberry Pi version). They sit on top of two things that run separately:
+
+- the **ZED SDK ROS 2 wrapper** (`zed_node`) — camera, visual odometry, spatial mapping. It needs the ZED SDK and CUDA (a Jetson); in the bisg_isaac sim and on its drone it is bisg_isaac's ZED stack, at `/drone_1/zed/zed_node`.
+- **MAVROS** — either started from here (`mavros_launch.sh`) or, with bisg_isaac, its own `px4-bridge` service at `/drone_1/mavros`.
+
+Topic inputs are relative names, so every node follows the drone namespace (`DRONE_NS`, e.g. `/drone_1`, applied as `--ros-args -r __ns:=...`). What the GCS reads (`/gcs/*`, `/brain/*`, `/barcode/*`) stays absolute.
 
 ---
 
 ## Deployment
 
-```bash
-# From your dev machine
-scp raspberry/* raspi5@<PI_IP>:~/
+Docker (preferred) — see the top-level README:
 
-# On the Pi — install Python dependencies
-pip3 install --break-system-packages flask opencv-python pyzbar pymavlink
+```bash
+DRONE_NS=/drone_1 MAV_DEVICE=/dev/ttyTHS1 docker compose -f docker/compose.yaml up -d
+```
+
+On the host:
+
+```bash
+# MAVROS (+ extras for VFR_HUD / GPS status), GeographicLib datasets, rosbridge
+sudo apt install ros-jazzy-mavros ros-jazzy-mavros-extras ros-jazzy-rosbridge-server
+sudo /opt/ros/jazzy/lib/mavros/install_geographiclib_datasets.sh
+sudo usermod -aG dialout $USER   # serial access to the flight controller
+
+# Python dependencies
+pip3 install --break-system-packages opencv-python pyzbar
 
 # Install systemd services
-sudo cp ~/rosbridge.service  /etc/systemd/system/
-sudo cp ~/drone-gcs.service  /etc/systemd/system/
+sudo cp rosbridge.service  /etc/systemd/system/
+sudo cp drone-gcs.service  /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now rosbridge.service
 
 # Launch everything manually (optional — systemd handles it on boot)
-bash ~/start_all.sh
+bash start_all.sh --ns /drone_1
 ```
 
 ---
@@ -29,7 +44,9 @@ bash ~/start_all.sh
 
 ### `gcs_control.py` — Service Manager
 ROS2 node that subscribes to `/gcs/cmd` and manages the lifecycle of every other node.  
-The GCS app sends `{"action":"start","service":"slam"}` — this node starts or stops the corresponding process and streams its status back on `/gcs/status` at 1 Hz.
+The GCS app sends `{"action":"start","service":"barcode"}` — this node starts or stops the corresponding process (`mavros`, `brain`, `barcode`) and streams its status back on `/gcs/status` at 1 Hz.
+
+**Environment:** `DRONE_NS` — namespace brain and barcode run in; `GCS_SERVICES` — comma list of the services the dashboard may start (the bisg profile sets `brain,barcode`: the sim owns MAVROS).
 
 **Topics:**
 - Sub: `/gcs/cmd` — `std_msgs/String` JSON commands
@@ -37,42 +54,37 @@ The GCS app sends `{"action":"start","service":"slam"}` — this node starts or 
 
 ---
 
-### `camera_publisher.py` — Pi Camera → ROS
-Uses **picamera2** to capture frames from the Raspberry Pi Camera Module and publish them as `sensor_msgs/CompressedImage` at up to 30 fps.
+### `zed_map_relay.py` — ZED Map for the GCS
+The ZED wrapper's `mapping/fused_cloud` carries the whole map in every message — in the bisg warehouse 4.2 M points, 68 MB, once a second, far too much for rosbridge. This node voxel-downsamples it to xyz float32 and republishes it as `gcs/map_cloud` at most every 2 s (~120 k points, ~0.6 MB/s through rosbridge).
 
-**Key details:**
-- Format: `BGR888` → JPEG encoded, quality configurable
-- QoS: `BEST_EFFORT / VOLATILE / KEEP_LAST(1)` — matches what barcode_detector expects
-- Topic: `/camera/forward/image_raw/compressed`
+It subscribes to the fused cloud **only while `gcs/map_cloud` has a subscriber**, so the ZED stack ships nothing when no GCS has the map open. Started by `rosbridge_boot.sh` / `start_all.sh`.
 
-**Parameters** (via `--ros-args -p name:=value`):
-
-| Parameter | Default | Description |
+| Parameter | Default | |
 |---|---|---|
-| `fps` | 30 | Capture frame rate |
-| `width` / `height` | 640 × 480 | Resolution |
-| `jpeg_quality` | 80 | JPEG quality (1–100) |
-| `frame_id` | `camera_forward` | TF frame |
+| `voxel` | 0.2 | m, downsampling grid |
+| `max_points` | 200000 | hard cap (random subset above it) |
+| `period` | 2.0 | s between published maps |
 
 ---
 
-### `mjpeg_server.py` — MJPEG HTTP Stream
-A minimal Flask server that captures from V4L2 (`cv2.VideoCapture`) and serves an MJPEG stream on `:8080/cam1`. This is what the **Dashboard camera** panel in the GCS app displays.
+### `kinetix_bridge.py` — Kinetix Buttons
+Backend of the GCS **Kinetix** tab. Runs in the `kinetix:jazzy` image with the Kinetix repo mounted at `/kinetix` (compose service `kinetix-bridge`, profile `kinetix`) and drives Kinetix only through its CLI, one job at a time:
 
-Uses a different capture path from `camera_publisher.py` (V4L2 vs picamera2), which is why a `BGR→RGB` colour conversion is applied — V4L2 on the RPi Camera returns RGB-ordered data that OpenCV treats as BGR.
+| Command (`/gcs/kinetix/cmd`) | Runs |
+|---|---|
+| `{"action":"run","scene":"warehouse_room","method":"tour","seed":0}` | `python3 -m kinetix run --scene config/scenes/<scene>.yaml --method <m> --rig mavros --seed <n>` |
+| `{"action":"sfm","run":"<run id>"}` (no run = newest) | `python3 -m kinetix sfm runs/<run>` |
+| `{"action":"abort"}` | SIGINT to the job = Kinetix's Ctrl+C: fly home at a safe height, AUTO.LAND, disarm |
 
-```bash
-python3 mjpeg_server.py [device] [port] [width] [height] [quality]
-# Default: device=0  port=8080  640x480  quality=80
-```
+`run` is refused while anything else publishes `<DRONE_NS>/mavros/setpoint_position/local` — Kinetix streams the setpoints itself and only one producer may run per drone. Status (`/gcs/kinetix/status`, 1 Hz JSON): state (`idle`, `flying`, `aborting`, `reconstructing`), job, log tail, scenes, methods, recent runs with `run.yaml` summary and `sfm/offline/metrics.json`, other setpoint producers, last message.
 
 ---
 
 ### `barcode_detector.py` — Vision + Inventory
-Subscribes to the Pi Camera ROS topic, runs **pyzbar** barcode/QR detection on every frame (throttled to 4 fps to save CPU), and for each new detection:
+Subscribes to the ZED left image (JPEG), runs **pyzbar** barcode/QR detection on every frame (throttled to 4 fps to save CPU), and for each new detection:
 
 1. Draws a green polygon + label overlay on the frame
-2. Stamps the detection with the current **SLAM position** (x, y, z, θ) from `/Odometry` or `/tf`
+2. Stamps the detection with the current **SLAM position** (x, y, z, θ) from the ZED odometry
 3. Publishes a JSON detection event on `/barcode/detection`
 4. Publishes the annotated image on `/barcode/roi/image/compressed`
 
@@ -81,16 +93,15 @@ Subscribes to the Pi Camera ROS topic, runs **pyzbar** barcode/QR detection on e
 **SLAM overlay:** x / y / z / heading rendered on every frame in the top-left corner so operators can visually confirm position data.
 
 **Topics:**
-- Sub: `/camera/forward/image_raw/compressed` (BEST_EFFORT QoS — must match publisher)
-- Sub: `/Odometry` (Point-LIO pose)
-- Sub: `/tf` (fallback: `camera_init → aft_mapped` transform)
+- Sub: `zed/zed_node/left/color/rect/image/compressed` (best-effort, depth 1)
+- Sub: `zed/zed_node/odom` (ZED visual odometry)
 - Pub: `/barcode/roi/image/compressed`
 - Pub: `/barcode/detection` — `{"barcode":"P003GUA","slam_x":1.2,"slam_y":-0.5,"slam_z":1.1,"slam_theta":-116.8}`
 
 ---
 
 ### `brain_node.py` — Autonomous Mission Planner
-Reads a waypoint mission from a **SQLite database** (`~/brain_data.db`), tracks the drone's position via SLAM odometry, and streams `geometry_msgs/PoseStamped` setpoints to the flight controller at 10 Hz.
+Reads a waypoint mission from a **SQLite database** (`~/brain_data.db`), tracks the drone's position from the flight controller's EKF (`mavros/local_position/pose`, which fuses the ZED odometry), and streams `geometry_msgs/PoseStamped` setpoints in that same frame to `mavros/setpoint_position/local` at 10 Hz.
 
 When the drone comes within `1.5 m` of a waypoint it advances to the next one. Mission progress is published to `/brain/planned_path` at 1 Hz for the GCS map to display.
 
@@ -101,31 +112,32 @@ On first run, seeds the DB with a default 5 × 5 m square mission. Edit with any
 
 ---
 
-### `mavlink_bridge.py` — MAVLink ↔ ROS2
-Replaces MAVROS with a lightweight **pymavlink** bridge. Connects to the Pixhawk over serial (auto-detects `/dev/serial0 → ttyAMA10 → ttyUSB0 → ttyACM0`), requests telemetry streams, and republishes as standard ROS2 messages.
+### `mavros_launch.sh` / `mavros_streams.py` — MAVROS
+Runs **MAVROS** (`apm.launch`, ArduPilot plugin set) on the Pixhawk serial link. The port is auto-detected (`/dev/serial0 → ttyAMA10 → ttyAMA0 → ttyUSB0 → ttyACM0`; `ttyAMA10` comes before `ttyAMA0` because on the RPi5 `ttyAMA0` may be the Bluetooth UART).
 
-**Why not MAVROS?** MAVROS requires binary ROS packages not easily available on RPi5, adds heavy overhead, and had sysid=0 detection issues with the RPi5 RP1 UART chip. This custom bridge handles reconnection, heartbeat parsing, and command sending with ~250 lines of Python.
+`mavros_streams.py` runs alongside it and calls `/mavros/set_stream_rate` each time the FCU (re)connects — ArduCopter does not stream telemetry to a companion computer unless asked or unless the port's `SRx_` parameters are set.
 
-**Published topics:**
+**Topics used by the GCS:**
 
-| Topic | Type | Source MAVLink message |
-|---|---|---|
-| `/drone/vfr` | String (JSON) | `VFR_HUD` |
-| `/drone/state` | String (JSON) | `HEARTBEAT` |
-| `/drone/motors` | String (JSON) | `SERVO_OUTPUT_RAW` / `RC_CHANNELS` |
-| `/drone/gps_status` | String (JSON) | `GPS_RAW_INT` |
-| `/mavros/battery` | `BatteryState` | `SYS_STATUS` |
-| `/mavros/imu/data` | `Imu` | `ATTITUDE` |
-| `/mavros/global_position/global` | `NavSatFix` | `GLOBAL_POSITION_INT` |
-| `/mavros/local_position/velocity_body` | `TwistStamped` | `GLOBAL_POSITION_INT` |
+| Topic | Type | QoS | Source MAVLink message |
+|---|---|---|---|
+| `/mavros/state` | `mavros_msgs/State` | reliable, transient-local | `HEARTBEAT` |
+| `/mavros/vfr_hud` | `mavros_msgs/VfrHud` | reliable | `VFR_HUD` (mavros_extras) |
+| `/mavros/rc/out` | `mavros_msgs/RCOut` | reliable | `SERVO_OUTPUT_RAW` |
+| `/mavros/gpsstatus/gps1/raw` | `mavros_msgs/GPSRAW` | reliable | `GPS_RAW_INT` (mavros_extras) |
+| `/mavros/battery` | `sensor_msgs/BatteryState` | best-effort | `SYS_STATUS` / `BATTERY_STATUS` |
+| `/mavros/imu/data` | `sensor_msgs/Imu` (ENU/FLU) | best-effort | `ATTITUDE` |
+| `/mavros/global_position/global` | `sensor_msgs/NavSatFix` | best-effort | `GLOBAL_POSITION_INT` |
+| `/mavros/local_position/velocity_body` | `geometry_msgs/TwistStamped` (FLU) | best-effort | `LOCAL_POSITION_NED` |
 
-**Commands** (send JSON to `/drone/cmd`):
-```json
-{"action":"arm"}
-{"action":"disarm"}
-{"action":"mode","mode":"GUIDED"}
-{"action":"takeoff","alt":5.0}
-{"action":"land"}
+ROS2 subscribers to the best-effort topics must use `qos_profile_sensor_data` (or any best-effort profile) — a reliable subscriber receives nothing.
+
+**Commands** (MAVROS services):
+```bash
+ros2 service call /mavros/cmd/arming mavros_msgs/srv/CommandBool "{value: true}"
+ros2 service call /mavros/set_mode   mavros_msgs/srv/SetMode     "{custom_mode: GUIDED}"
+ros2 service call /mavros/cmd/takeoff mavros_msgs/srv/CommandTOL "{altitude: 5.0}"
+ros2 service call /mavros/cmd/land    mavros_msgs/srv/CommandTOL "{}"
 ```
 
 **Serial configuration:**
@@ -140,33 +152,14 @@ MAV_BAUD=57600           # baud rate
 
 ---
 
-### `slam_launch.sh` — LiDAR + SLAM Launcher
-Orchestrates the three-terminal manual sequence as a single automated script:
-
-1. Sets Ethernet interface (`eth0`) static IP for the LiDAR
-2. Launches `unitree_lidar_ros2` driver (LiDAR → `/unilidar/cloud`)
-3. Waits for LiDAR topics to appear
-4. Launches **Point-LIO** SLAM (`/cloud_registered`, `/Odometry`, `/tf`)
-
-```bash
-bash slam_launch.sh [--lidar unitree|rplidar|ydlidar] [--port /dev/ttyUSB0] [--map existing.map]
-```
-
----
-
-### `slam_params.yaml` — Point-LIO Configuration
-Sensor extrinsics, feature extraction thresholds, and filter parameters for the Point-LIO algorithm. Tuned for the Unitree 4D LiDAR L1 mounted on a 250 mm quadcopter frame.
-
----
-
 ### `start_all.sh` — Full Stack Launcher
 One-command startup for all components. Accepts CLI flags to enable/disable individual modules:
 
 ```bash
-bash start_all.sh [--no-slam] [--no-mjpeg] [--no-cam] [--brain] [--mavros PORT]
+bash start_all.sh [--ns /drone_1] [--mavros PORT] [--brain] [--barcode]
 ```
 
-Starts: rosbridge → camera (ROS) → MJPEG server → SLAM → (optionally) MAVROS + Brain.  
+Starts: rosbridge → ZED map relay → (optionally) MAVROS, brain, barcode.  
 All logs go to `~/gcs_logs/<timestamp>/`.
 
 ---

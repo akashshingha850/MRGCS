@@ -13,6 +13,7 @@ function now ()   { return new Date().toLocaleTimeString('en-GB', {hour12:false}
 // ── shared state ──────────────────────────────────────────────────────────────
 const S = {
   speed: 0, vspeed: 0, altitude: 0, heading: 0,
+  autopilot: null,          // 'apm' | 'px4', from MAVROS vehicle_info_get
   roll: 0, pitch: 0, yaw: 0,
   vx: 0, vy: 0, vz: 0,
   battery: { pct: 0, voltage: 0 },
@@ -24,7 +25,6 @@ const S = {
   detections: [],
   dbLog: [],
   volumetry: [],
-  lidar: null,
   occMap: null,
   slamPose: { x: 0, y: 0, theta: 0 },
   slamTrail: [],
@@ -39,7 +39,8 @@ const S = {
   missionDone:  false,
   coordOrigin:  null,   // {lat, lon, slamX, slamY} — GPS↔SLAM alignment snapshot
   // pi services (controlled from dashboard)
-  svcStatus: { slam: 'stopped', camera: 'stopped', camera2: 'stopped', mjpeg: 'stopped', mavros: 'stopped', brain: 'stopped', barcode: 'stopped' },
+  svcStatus: { mavros: 'stopped', brain: 'stopped', barcode: 'stopped' },
+  kinetix: null, kinetixTs: 0,   // /gcs/kinetix/status (kinetix_bridge.py)
 }
 
 const HIST_MAX = 120   // 120 data points per chart
@@ -57,7 +58,9 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
 })
 
 // ── ROS connection ────────────────────────────────────────────────────────────
-let ROS_URL = localStorage.getItem('ros_url') || 'ws://raspi5.local:9090'
+// Served over http(s) (the web app): rosbridge on the same host. Electron (file://): the Pi default.
+let ROS_URL = localStorage.getItem('ros_url') ||
+  (location.protocol.startsWith('http') ? `ws://${location.hostname}:9090` : 'ws://raspi5.local:9090')
 let ros = null, reconnTimer = null
 
 function setDot (state) {
@@ -72,37 +75,8 @@ function connect () {
   ros.on('connection', () => { setDot('connected'); clearTimeout(reconnTimer); subscribe() })
   ros.on('error',      () => { setDot('error');     sched() })
   ros.on('close',      () => { setDot('error');     sched() })
-
-  // Attempt MJPEG camera on same host, port 8080
-  const host = ROS_URL.replace(/^wss?:\/\//, '').replace(/:\d+$/, '')
-  connectMJPEG(`http://${host}:8080/cam1`)
 }
 
-// ── MJPEG camera ──────────────────────────────────────────────────────────────
-function connectMJPEG (url) {
-  const img    = $('cam1-img')
-  const canvas = $('cam1')
-  const sig    = $('cam1-sig')
-
-  img.onload = () => {
-    // First frame loaded — switch to img, hide test pattern canvas
-    img.style.display   = 'block'
-    canvas.style.display = 'none'
-    sig.textContent  = 'LIVE'
-    sig.className    = 'cam-sig ok'
-  }
-
-  img.onerror = () => {
-    img.style.display    = 'none'
-    canvas.style.display = 'block'
-    sig.textContent  = 'NO SIGNAL'
-    sig.className    = 'cam-sig no'
-    // Retry after 3 s
-    setTimeout(() => { if (img.src) img.src = url + '?t=' + Date.now() }, 3000)
-  }
-
-  img.src = url
-}
 function sched () { clearTimeout(reconnTimer); reconnTimer = setTimeout(connect, 3000) }
 
 // ── network discovery ─────────────────────────────────────────────────────────
@@ -254,17 +228,17 @@ function initConnPopover () {
     scanBtn.disabled = false
   })
 }
-function sub (name, type, cb) {
-  const t = new ROSLIB.Topic({ ros, name, messageType: type })
+function sub (name, type, cb, opts = {}) {
+  const t = new ROSLIB.Topic({ ros, name, messageType: type, ...opts })
   t.subscribe(cb)
   return t
 }
 
 // ── ROS service / publish helpers ─────────────────────────────────────────────
-function rosService (name, type, req, cb) {
+function rosService (name, type, req, cb, onErr) {
   if (!ros) return
   const svc = new ROSLIB.Service({ ros, name, serviceType: type })
-  svc.callService(new ROSLIB.ServiceRequest(req), cb || (() => {}))
+  svc.callService(new ROSLIB.ServiceRequest(req), cb || (() => {}), onErr || (() => {}))
 }
 
 function rosPub (name, type, msg) {
@@ -292,24 +266,34 @@ function addCmdLog (cmd, result) {
   while (log.children.length > 25) log.removeChild(log.lastChild)
 }
 
-// ── drone commands (via mavlink_bridge /drone/cmd topic) ─────────────────────
-let _droneCmdPub  = null
+// ── drone commands (MAVROS services / setpoint topics) ────────────────────────
+// MAVROS lives under MAVROS_NS: '/mavros' on the Pi, '/drone_<n>/mavros' in the
+// bisg_isaac sim — found on connect by detectMavrosNs().
+let MAVROS_NS = '/mavros'
 let _armPendingTs = 0
 
-function droneCmd (payload) {
-  if (!ros) return
-  if (!_droneCmdPub) {
-    _droneCmdPub = new ROSLIB.Topic({ ros, name: '/drone/cmd', messageType: 'std_msgs/String' })
-  }
-  _droneCmdPub.publish(new ROSLIB.Message({ data: JSON.stringify(payload) }))
+// The UI speaks ArduCopter mode names; PX4 equivalents for a PX4 FCU
+const PX4_MODES = {
+  STABILIZE: 'STABILIZED', GUIDED: 'OFFBOARD', LOITER: 'AUTO.LOITER',
+  AUTO: 'AUTO.MISSION', RTL: 'AUTO.RTL', LAND: 'AUTO.LAND',
+}
+function fcuMode (mode) {
+  return S.autopilot === 'px4' ? (PX4_MODES[mode] || mode) : mode
+}
+
+// Call a MAVROS service and log OK/FAIL from the response field `okField`
+function mavrosCall (label, name, type, req, okField = 'success') {
+  addCmdLog(label, 'SENT')
+  rosService(MAVROS_NS + name, type, req,
+    r   => addCmdLog(label, r && r[okField] ? 'OK' : 'FAIL'),
+    err => addCmdLog(label + ' (' + err + ')', 'FAIL'))
 }
 
 function cmdArm () {
   const t = Date.now()
   if (t - _armPendingTs < 800) {
     _armPendingTs = 0
-    droneCmd({ action: 'arm' })
-    addCmdLog('ARM', 'SENT')
+    mavrosCall('ARM', '/cmd/arming', 'mavros_msgs/CommandBool', { value: true })
   } else {
     _armPendingTs = t
     addCmdLog('ARM', 'click again to confirm')
@@ -317,55 +301,171 @@ function cmdArm () {
 }
 
 function cmdDisarm () {
-  droneCmd({ action: 'disarm' })
-  addCmdLog('DISARM', 'SENT')
+  mavrosCall('DISARM', '/cmd/arming', 'mavros_msgs/CommandBool', { value: false })
 }
 
 function cmdSetMode (mode) {
-  droneCmd({ action: 'mode', mode })
-  addCmdLog('MODE ' + mode, 'SENT')
+  const m = fcuMode(mode)
+  mavrosCall('MODE ' + m, '/set_mode', 'mavros_msgs/SetMode',
+    { base_mode: 0, custom_mode: m }, 'mode_sent')
 }
 
+// ArduCopter: takeoff altitude is relative to home; lat/lon 0 = current position.
+// PX4 reads the altitude as AMSL, so a "5 m" request would be wrong — not sent.
 function cmdTakeoff () {
   const alt = parseFloat($('tkoff-alt').value) || 5
-  droneCmd({ action: 'takeoff', alt })
-  addCmdLog('TAKEOFF ' + alt + 'm', 'SENT')
+  if (S.autopilot === 'px4') {
+    addCmdLog('TAKEOFF (PX4 takes an AMSL altitude — not supported here)', 'FAIL')
+    return
+  }
+  mavrosCall('TAKEOFF ' + alt + 'm', '/cmd/takeoff', 'mavros_msgs/CommandTOL',
+    { min_pitch: 0, yaw: 0, latitude: 0, longitude: 0, altitude: alt })
 }
 
+// PX4 treats lat/lon 0 as a real coordinate, so it lands through its LAND mode
 function cmdLand () {
-  droneCmd({ action: 'land' })
-  addCmdLog('LAND', 'SENT')
+  if (S.autopilot === 'px4') return cmdSetMode('LAND')
+  mavrosCall('LAND', '/cmd/land', 'mavros_msgs/CommandTOL',
+    { min_pitch: 0, yaw: 0, latitude: 0, longitude: 0, altitude: 0 })
 }
 
+// Local ENU setpoint (metres from the EKF origin) — vehicle must be in GUIDED
 function cmdGoto () {
   const x = parseFloat($('sp-x').value) || 0
   const y = parseFloat($('sp-y').value) || 0
   const z = parseFloat($('sp-z').value) || 5
-  droneCmd({ action: 'goto', x, y, z })
+  rosPub(MAVROS_NS + '/setpoint_position/local', 'geometry_msgs/PoseStamped', {
+    header: { frame_id: 'map' },
+    pose: { position: { x, y, z }, orientation: { x: 0, y: 0, z: 0, w: 1 } },
+  })
   addCmdLog(`GOTO x=${x} y=${y} z=${z}`, 'SENT')
 }
 
 function cmdVelStop () {
-  droneCmd({ action: 'vel_stop' })
+  rosPub(MAVROS_NS + '/setpoint_velocity/cmd_vel', 'geometry_msgs/TwistStamped', {
+    header: { frame_id: 'map' },
+    twist: { linear: { x: 0, y: 0, z: 0 }, angular: { x: 0, y: 0, z: 0 } },
+  })
   addCmdLog('VEL STOP', 'SENT')
 }
 
-// ── SLAM commands ─────────────────────────────────────────────────────────────
-function slamSaveMap () {
-  rosService('/slam_toolbox/save_map', 'slam_toolbox/SaveMap',
-    { name: { data: 'gcs_map_' + Date.now() } },
-    r => addCmdLog('SAVE MAP', r && r.result === 0 ? 'OK' : 'FAIL'))
+// ── SLAM commands (ZED wrapper services) ──────────────────────────────────────
+function zedCall (label, name, type, req) {
+  addCmdLog(label, 'SENT')
+  rosService(ZED_NS + name, type, req,
+    r   => addCmdLog(label + (r && r.message ? ' (' + r.message + ')' : ''), r && r.success ? 'OK' : 'FAIL'),
+    err => addCmdLog(label + ' (' + err + ')', 'FAIL'))
 }
 
 function slamToggle (enable) {
-  rosService('/slam_toolbox/toggle_interactive_mode', 'slam_toolbox/ToggleInteractive',
-    {},
-    () => addCmdLog(enable ? 'SLAM START' : 'SLAM PAUSE', 'SENT'))
+  zedCall(enable ? 'MAPPING ON' : 'MAPPING OFF', '/enable_mapping', 'std_srvs/SetBool', { data: enable })
 }
 
+// ZED odometry is fused by the flight controller's EKF: a reset while flying is a position jump
 function slamResetPose () {
-  rosService('/slam_toolbox/clear_changes', 'slam_toolbox/ClearChanges', {},
-    () => addCmdLog('SLAM RESET', 'SENT'))
+  if (S.armed) { addCmdLog('RESET POSE (disarm first — the EKF fuses ZED odometry)', 'FAIL'); return }
+  zedCall('RESET POSE', '/reset_pos_tracking', 'std_srvs/Trigger', {})
+}
+
+// Download the map on screen (the relayed, downsampled cloud) as an ASCII .pcd
+function slamSaveMap () {
+  const pts = SLAM3D.points()
+  if (!pts.length) { addCmdLog('SAVE MAP (no map yet)', 'FAIL'); return }
+  const n = pts.length / 3
+  const lines = new Array(n)
+  for (let i = 0; i < n; i++) lines[i] = `${pts[3*i].toFixed(3)} ${pts[3*i+1].toFixed(3)} ${pts[3*i+2].toFixed(3)}`
+  const head = `# .PCD v0.7\nVERSION 0.7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\nWIDTH ${n}\nHEIGHT 1\nVIEWPOINT 0 0 0 1 0 0 0\nPOINTS ${n}\nDATA ascii\n`
+  const name = 'zed_map_' + new Date().toISOString().replace(/[:.]/g, '-') + '.pcd'
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(new Blob([head + lines.join('\n') + '\n'], { type: 'text/plain' }))
+  a.download = name
+  a.click()
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000)
+  $('sl-mw').textContent = name
+  addCmdLog(`SAVE MAP ${n.toLocaleString()} pts`, 'OK')
+}
+
+// ── Kinetix (kinetix_bridge.py) ───────────────────────────────────────────────
+let _kxRunPendingTs = 0
+
+function kinetixCmd (payload) {
+  rosPub('/gcs/kinetix/cmd', 'std_msgs/String', { data: JSON.stringify(payload) })
+}
+
+// Start flies the drone: two clicks within 0.8 s, like ARM
+function kxRun () {
+  const t = Date.now()
+  if (t - _kxRunPendingTs >= 800) { _kxRunPendingTs = t; $('kx-msg').textContent = 'click again to start the scan'; return }
+  _kxRunPendingTs = 0
+  kinetixCmd({ action: 'run', scene: $('kx-scene').value, method: $('kx-method').value,
+               seed: parseInt($('kx-seed').value, 10) || 0 })
+  addCmdLog('KINETIX SCAN ' + $('kx-method').value, 'SENT')
+}
+
+function kxAbort () {
+  kinetixCmd({ action: 'abort' })
+  addCmdLog('KINETIX ABORT', 'SENT')
+}
+
+function kxSfm (run) {
+  kinetixCmd(run ? { action: 'sfm', run } : { action: 'sfm' })
+  addCmdLog('KINETIX SFM ' + (run || 'latest'), 'SENT')
+}
+
+function fillSelect (el, values) {
+  if (el.dataset.opts === values.join(',')) return          // keep the user's choice
+  const keep = el.value
+  el.innerHTML = values.map(v => `<option value="${v}">${v}</option>`).join('')
+  if (values.includes(keep)) el.value = keep
+  el.dataset.opts = values.join(',')
+}
+
+function updateKinetixUI () {
+  const k = S.kinetix
+  if (!k) return
+  const busy = k.state !== 'idle'
+  $('kx-bridge').textContent = 'online'
+  $('kx-bridge').className   = 'sv ok'
+  $('kx-state').textContent  = k.state
+  $('kx-state').className    = 'sv ' + ({ flying: 'accent', reconstructing: 'accent', aborting: 'warn' }[k.state] || '')
+  $('kx-run').textContent    = (k.job && k.job.run) || '—'
+  $('kx-elapsed').textContent = k.elapsed_s != null
+    ? `${Math.floor(k.elapsed_s / 60)}:${String(k.elapsed_s % 60).padStart(2, '0')}` : '—'
+  $('kx-msg').textContent    = k.msg || ''
+  fillSelect($('kx-scene'),  k.scenes  || [])
+  fillSelect($('kx-method'), k.methods || [])
+  // first status: Kinetix's room_scan.sh defaults (warehouse_room, tour)
+  if (!$('kx-method').dataset.init && (k.methods || []).length) {
+    if ((k.methods || []).includes('tour'))           $('kx-method').value = 'tour'
+    if ((k.scenes  || []).includes('warehouse_room')) $('kx-scene').value  = 'warehouse_room'
+    $('kx-method').dataset.init = '1'
+  }
+
+  const warn = $('kx-warn')
+  if (k.other_setpoint_producers > 0) {
+    warn.style.display = 'block'
+    warn.textContent = `${k.other_setpoint_producers} other setpoint producer(s) on the drone ` +
+      '(another Kinetix run? the brain node?) — Start is refused until it stops.'
+  } else warn.style.display = 'none'
+
+  $('btn-kx-run').disabled   = busy || k.other_setpoint_producers > 0
+  $('btn-kx-abort').disabled = !busy || k.state === 'aborting'
+  $('btn-kx-sfm').disabled   = busy || !(k.runs || []).length
+
+  const log = $('kx-log')
+  const atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 4
+  log.textContent = (k.log || []).join('\n') || '(no job output yet)'
+  if (atEnd) log.scrollTop = log.scrollHeight
+
+  const f = (v, d) => v == null ? '—' : (typeof v === 'number' ? v.toFixed(d) : v)
+  $('kx-runs').querySelector('tbody').innerHTML = (k.runs || []).map(r => {
+    const m = r.sfm || {}
+    return `<tr><td class="id">${r.id}</td><td>${r.method || '—'}</td><td>${r.frames ?? '—'}</td>
+      <td>${r.stop || '—'}</td><td>${r.coverage != null ? (r.coverage * 100).toFixed(1) + '%' : '—'}</td>
+      <td>${m.registered != null ? m.registered + '/' + m.n_frames : '—'}</td><td>${m.points3D ?? '—'}</td>
+      <td>${f(m.reproj_px, 2)}</td><td>${f(m.ate_m, 3)}</td>
+      <td><button class="cmd-btn-sm" ${busy ? 'disabled' : ''} onclick="kxSfm('${r.id}')">Reconstruct</button></td></tr>`
+  }).join('')
 }
 
 // ── init controls ─────────────────────────────────────────────────────────────
@@ -384,6 +484,10 @@ function initControls () {
     })
   })
 
+  $('btn-kx-run').addEventListener('click', kxRun)
+  $('btn-kx-abort').addEventListener('click', kxAbort)
+  $('btn-kx-sfm').addEventListener('click', () => kxSfm())
+
   $('btn-goto').addEventListener('click', cmdGoto)
   $('btn-vel-stop').addEventListener('click', cmdVelStop)
   $('btn-hold').addEventListener('click', () => cmdSetMode('LOITER'))
@@ -400,130 +504,219 @@ function initControls () {
 }
 
 // ── subscriptions ─────────────────────────────────────────────────────────────
-function subscribe () {
-  // speed + heading + altitude  (mavlink_bridge → /drone/vfr JSON)
-  sub('/drone/vfr', 'std_msgs/String', m => {
-    try {
-      const d   = JSON.parse(m.data)
-      S.speed   = d.airspeed  ?? d.groundspeed ?? 0
-      S.vspeed  = d.climb     ?? 0
-      S.heading = d.heading   ?? 0
-      S.altitude = d.alt      ?? 0
+// All MAVROS topics live in one list so they can be re-subscribed when the
+// namespace is detected, and once MAVROS reports in: it publishes battery, IMU,
+// GPS and local position with SensorDataQoS (best-effort), and older rosbridge
+// builds create a *reliable* subscription when a topic has no publisher yet —
+// i.e. when the GCS connects before MAVROS is started from the Services panel —
+// and then never receive data. Re-subscribing lets rosbridge match the QoS.
+let _mavrosSubs = []
+let _mavrosLive = false
+let _vfrTs      = 0     // last /vfr_hud message; 0 = plugin not loaded (bisg lean list)
+let _lpHistTs   = 0
+
+// Find the MAVROS, ZED and map-relay topics through rosapi: /mavros/... on a
+// plain setup, /drone_1/mavros/... and /drone_1/zed/zed_node/... in bisg_isaac.
+// Polled every 5 s, so components started after the GCS connects are picked up.
+function detectNamespaces () {
+  const conn = ros
+  ros.getTopics(r => {
+    if (ros !== conn) return
+    const topics = (r.topics || []).slice().sort()
+    const find = suffix => topics.find(t => t.endsWith(suffix))
+    const st  = find('/mavros/state')
+    const zo  = find('/zed_node/odom')
+    const map = find('/gcs/map_cloud')
+    if (st && st.slice(0, -'/state'.length) !== MAVROS_NS) {
+      MAVROS_NS = st.slice(0, -'/state'.length)
+      _mavrosLive = false
+      subscribeMavros()
+    }
+    const zns = zo ? zo.slice(0, -'/odom'.length) : ZED_NS
+    if (zns !== ZED_NS || (map && map !== MAP_TOPIC)) {
+      ZED_NS    = zns
+      MAP_TOPIC = map || MAP_TOPIC
+      subscribeZed()
+    }
+  }, () => {})
+  setTimeout(() => { if (ros === conn) detectNamespaces() }, 5000)
+}
+
+// MAV_AUTOPILOT from MAVROS: 3 = ArduPilot, 12 = PX4
+function detectAutopilot () {
+  rosService(MAVROS_NS + '/vehicle_info_get', 'mavros_msgs/VehicleInfoGet',
+    { sysid: 0, compid: 0, get_all: false },
+    r => {
+      const v = r && r.success && (r.vehicles || [])[0]
+      if (v) S.autopilot = v.autopilot === 12 ? 'px4' : 'apm'
+    })
+}
+
+function subscribeMavros () {
+  _mavrosSubs.forEach(t => t.unsubscribe())
+  const ns = MAVROS_NS
+  _mavrosSubs = [
+    // state — armed / mode / FCU link
+    sub(ns + '/state', 'mavros_msgs/State', m => {
+      if (m.armed && !S.armed) S.flightStart = Date.now()
+      if (!m.armed) S.flightStart = null
+      S.armed = m.armed ?? false
+      S.mode  = m.connected ? (m.mode || '—') : '—'
+      if (m.connected && !S.autopilot) detectAutopilot()
+      if (!_mavrosLive) {
+        _mavrosLive = true
+        subscribeMavros()
+      }
+    }),
+
+    // speed + heading + altitude  (VFR_HUD, mavros_extras)
+    sub(ns + '/vfr_hud', 'mavros_msgs/VfrHud', m => {
+      _vfrTs = Date.now()
+      S.speed    = m.airspeed  ?? m.groundspeed ?? 0
+      S.vspeed   = m.climb     ?? 0
+      S.heading  = m.heading   ?? 0
+      S.altitude = m.altitude  ?? 0
       pushHist(S.spdHistory,  S.speed)
       pushHist(S.vspdHistory, S.vspeed)
       pushHist(S.altHistory,  S.altitude)
-    } catch (_) {}
-  })
+    }),
 
-  // battery
-  sub('/mavros/battery', 'sensor_msgs/BatteryState', m => {
-    const raw = m.percentage ?? 0
-    S.battery.pct     = raw > 1 ? raw : raw * 100
-    S.battery.voltage = m.voltage ?? 0
-  })
+    // Without vfr_hud (bisg_isaac's lean plugin list) take speed / climb /
+    // altitude from the EKF local position and heading from the attitude.
+    // Altitude is then above the EKF origin, not MSL.
+    sub(ns + '/local_position/velocity_local', 'geometry_msgs/TwistStamped', m => {
+      if (Date.now() - _vfrTs < 2000) return
+      const v = m.twist.linear
+      S.speed   = Math.hypot(v.x ?? 0, v.y ?? 0)
+      S.vspeed  = v.z ?? 0
+      S.heading = (S.yaw + 360) % 360
+      // history at ~4 Hz, the VFR_HUD rate the charts are scaled for
+      if (Date.now() - _lpHistTs < 250) return
+      _lpHistTs = Date.now()
+      pushHist(S.spdHistory,  S.speed)
+      pushHist(S.vspdHistory, S.vspeed)
+      pushHist(S.altHistory,  S.altitude)
+    }),
+    sub(ns + '/local_position/pose', 'geometry_msgs/PoseStamped', m => {
+      if (Date.now() - _vfrTs < 2000) return
+      S.altitude = m.pose.position.z ?? 0
+    }),
 
-  // attitude (quaternion → euler)
-  sub('/mavros/imu/data', 'sensor_msgs/Imu', m => {
-    const q = m.orientation
-    S.roll  = Math.atan2(2*(q.w*q.x + q.y*q.z), 1 - 2*(q.x*q.x + q.y*q.y)) * R2D
-    S.pitch = Math.asin (clamp(2*(q.w*q.y - q.z*q.x), -1, 1)) * R2D
-    S.yaw   = Math.atan2(2*(q.w*q.z + q.x*q.y), 1 - 2*(q.y*q.y + q.z*q.z)) * R2D
-  })
+    // GPS status  (GPS_RAW_INT — fix_type 3 = 3D fix)
+    sub(ns + '/gpsstatus/gps1/raw', 'mavros_msgs/GPSRAW', m => {
+      S.gps.fix  = m.fix_type ?? 0
+      S.gps.sats = m.satellites_visible === 255 ? 0 : (m.satellites_visible ?? 0)
+    }),
 
-  // velocity body frame
-  sub('/mavros/local_position/velocity_body', 'geometry_msgs/TwistStamped', m => {
-    S.vx = m.twist.linear.x ?? 0
-    S.vy = m.twist.linear.y ?? 0
-    S.vz = m.twist.linear.z ?? 0
-  })
-
-  // GPS
-  sub('/mavros/global_position/global', 'sensor_msgs/NavSatFix', m => {
-    S.gps.lat    = m.latitude
-    S.gps.lon    = m.longitude
-    S.gps.altAbs = m.altitude
-    // Capture GPS↔SLAM alignment origin once we have both
-    if (!S.coordOrigin && (S.slamPose.x !== 0 || S.slamPose.y !== 0)) {
-      S.coordOrigin = { lat: m.latitude, lon: m.longitude, slamX: S.slamPose.x, slamY: S.slamPose.y }
-    }
-    if (S.trail.length === 0 ||
-        Math.abs(S.trail[S.trail.length-1].lat - m.latitude)  > 1e-7 ||
-        Math.abs(S.trail[S.trail.length-1].lon - m.longitude) > 1e-7) {
-      S.trail.push({ lat: m.latitude, lon: m.longitude })
-      if (S.trail.length > 500) S.trail.shift()
-    }
-  })
-
-  // GPS status  (mavlink_bridge → /drone/gps_status JSON)
-  sub('/drone/gps_status', 'std_msgs/String', m => {
-    try {
-      const d    = JSON.parse(m.data)
-      S.gps.fix  = d.fix_type           ?? 0
-      S.gps.sats = d.satellites_visible ?? 0
-    } catch (_) {}
-  })
-
-  // state — armed / mode  (mavlink_bridge → /drone/state JSON)
-  sub('/drone/state', 'std_msgs/String', m => {
-    try {
-      const d = JSON.parse(m.data)
-      if (d.armed && !S.armed) S.flightStart = Date.now()
-      if (!d.armed) S.flightStart = null
-      S.armed = d.armed ?? false
-      S.mode  = d.mode  || '—'
-    } catch (_) {}
-  })
-
-  // motor throttle  (mavlink_bridge → /drone/motors JSON {channels:[pwm…]})
-  sub('/drone/motors', 'std_msgs/String', m => {
-    try {
-      const ch = JSON.parse(m.data).channels || []
+    // motor throttle  (SERVO_OUTPUT_RAW → rc/out, PWM µs)
+    sub(ns + '/rc/out', 'mavros_msgs/RCOut', m => {
+      const ch = m.channels || []
       for (let i = 0; i < 6; i++) {
         const pwm = ch[i] ?? 1000
         S.motors[i] = clamp((pwm - 1000) / 1000 * 100, 0, 100)
       }
-    } catch (_) {}
-  })
+    }),
 
-  // Point-LIO — nube de puntos registrada (frame camera_init)
-  sub('/cloud_registered', 'sensor_msgs/PointCloud2', m => {
-    const xyz = decodePC2xyz(m)
-    SLAM3D.addScan(xyz)
-    $('sl-pts').textContent   = SLAM3D.count.toLocaleString()
-    $('sl-astep').textContent = '3D'
-    $('sl-status').textContent = 'Active'
-    $('sl-status').className   = 'sv ok'
-  })
+    // battery
+    sub(ns + '/battery', 'sensor_msgs/BatteryState', m => {
+      const raw = m.percentage ?? 0
+      S.battery.pct     = raw > 1 ? raw : raw * 100
+      S.battery.voltage = m.voltage ?? 0
+    }),
 
-  // Point-LIO — odometría (/Odometry si existe, fallback por TF)
-  sub('/Odometry', 'nav_msgs/Odometry', m => {
-    const p = m.pose.pose
-    S.slamPose.x = p.position.x
-    S.slamPose.y = p.position.y
-    const q = p.orientation
-    S.slamPose.theta = Math.atan2(2*(q.w*q.z + q.x*q.y), 1 - 2*(q.y*q.y + q.z*q.z)) * R2D
-    updateSlamPoseUI()
-    pushSlamTrail()
-  })
+    // attitude — MAVROS publishes ENU / FLU; convert to aviation (NED / FRD)
+    // angles for the AHRS: roll unchanged, pitch negated, yaw = 90° − yaw_enu
+    sub(ns + '/imu/data', 'sensor_msgs/Imu', m => {
+      const q = m.orientation
+      const yawEnu = Math.atan2(2*(q.w*q.z + q.x*q.y), 1 - 2*(q.y*q.y + q.z*q.z)) * R2D
+      S.roll  =  Math.atan2(2*(q.w*q.x + q.y*q.z), 1 - 2*(q.x*q.x + q.y*q.y)) * R2D
+      S.pitch = -Math.asin (clamp(2*(q.w*q.y - q.z*q.x), -1, 1)) * R2D
+      S.yaw   = ((90 - yawEnu) % 360 + 540) % 360 - 180
+    }),
 
-  // Point-LIO pose via /tf topic — subscribe directly, no tf2_web_republisher needed
-  sub('/tf', 'tf2_msgs/TFMessage', m => {
-    const tr = (m.transforms || []).find(t =>
-      t.header.frame_id === 'camera_init' && t.child_frame_id === 'aft_mapped')
-    if (!tr) return
-    const p = tr.transform.translation
-    S.slamPose.x = p.x
-    S.slamPose.y = p.y
-    const q = tr.transform.rotation
-    S.slamPose.theta = Math.atan2(2*(q.w*q.z + q.x*q.y), 1 - 2*(q.y*q.y + q.z*q.z)) * R2D
-    updateSlamPoseUI()
-    pushSlamTrail()
-  })
+    // velocity body frame (FLU: x forward, y left, z up)
+    sub(ns + '/local_position/velocity_body', 'geometry_msgs/TwistStamped', m => {
+      S.vx = m.twist.linear.x ?? 0
+      S.vy = m.twist.linear.y ?? 0
+      S.vz = m.twist.linear.z ?? 0
+    }),
+
+    // GPS
+    sub(ns + '/global_position/global', 'sensor_msgs/NavSatFix', m => {
+      S.gps.lat    = m.latitude
+      S.gps.lon    = m.longitude
+      S.gps.altAbs = m.altitude
+      // Capture GPS↔SLAM alignment origin once we have both
+      if (!S.coordOrigin && (S.slamPose.x !== 0 || S.slamPose.y !== 0)) {
+        S.coordOrigin = { lat: m.latitude, lon: m.longitude, slamX: S.slamPose.x, slamY: S.slamPose.y }
+      }
+      if (S.trail.length === 0 ||
+          Math.abs(S.trail[S.trail.length-1].lat - m.latitude)  > 1e-7 ||
+          Math.abs(S.trail[S.trail.length-1].lon - m.longitude) > 1e-7) {
+        S.trail.push({ lat: m.latitude, lon: m.longitude })
+        if (S.trail.length > 500) S.trail.shift()
+      }
+    }),
+  ]
+}
+
+// ── ZED: camera, VIO pose, spatial map ────────────────────────────────────────
+// ZED_NS = the wrapper's node namespace; MAP_TOPIC = zed_map_relay.py output
+let ZED_NS    = '/zed/zed_node'
+let MAP_TOPIC = '/gcs/map_cloud'
+let _zedSubs  = []
+
+function subscribeZed () {
+  _zedSubs.forEach(t => t.unsubscribe())
+  _zedSubs = [
+    // cam1 — dashboard: ZED left image, JPEG, ≤ 10 fps through rosbridge
+    subCamImage(ZED_NS + '/left/color/rect/image/compressed', 'cam1', 'cam1-sig', 0, null,
+      { throttle_rate: 100, queue_length: 1 }),
+
+    // VIO pose (frame odom = map at start, child zed_camera_link)
+    sub(ZED_NS + '/odom', 'nav_msgs/Odometry', m => {
+      const p = m.pose.pose
+      S.slamPose.x = p.position.x
+      S.slamPose.y = p.position.y
+      const q = p.orientation
+      S.slamPose.theta = Math.atan2(2*(q.w*q.z + q.x*q.y), 1 - 2*(q.y*q.y + q.z*q.z)) * R2D
+      $('sl-maxr').textContent = m.child_frame_id || '—'
+      updateSlamPoseUI()
+      pushSlamTrail()
+    }, { throttle_rate: 100, queue_length: 1 }),
+
+    // Spatial map — each message is the whole map, so it replaces the view
+    sub(MAP_TOPIC, 'sensor_msgs/PointCloud2', m => {
+      SLAM3D.clearMap()
+      SLAM3D.addScan(decodePC2xyz(m))
+      $('sl-pts').textContent    = SLAM3D.count.toLocaleString()
+      $('sl-minr').textContent   = m.header.frame_id || '—'
+      $('sl-status').textContent = 'Mapping'
+      $('sl-status').className   = 'sv ok'
+    }, { queue_length: 1 }),
+  ]
+}
+
+function subscribe () {
+  // fresh ROSLIB.Ros — old topic objects belong to the closed connection
+  _mavrosSubs  = []
+  _mavrosLive  = false
+  S.autopilot  = null
+  subscribeMavros()
+  _zedSubs = []
+  subscribeZed()
+  detectNamespaces()
 
   // GCS control node — service status
   sub('/gcs/status', 'std_msgs/String', m => {
     try { S.svcStatus = JSON.parse(m.data) } catch (_) {}
     updateSvcUI()
+  })
+
+  // Kinetix bridge — capture / reconstruction jobs
+  sub('/gcs/kinetix/status', 'std_msgs/String', m => {
+    try { S.kinetix = JSON.parse(m.data); S.kinetixTs = Date.now() } catch (_) { return }
+    updateKinetixUI()
   })
 
   // Brain node — planned path
@@ -586,8 +779,6 @@ function subscribe () {
   })
 
   // Compressed camera frames
-  // cam1  — dashboard: raw forward feed
-  subCamImage('/camera/forward/image_raw/compressed', 'cam1',  'cam1-sig', 180, [0, 2])
   // icam1 — image processing tab: ROI-annotated feed from barcode_detector.py
   subCamImage('/barcode/roi/image/compressed', 'icam1', 'icam1-sig', 0, null)
 }
@@ -595,9 +786,9 @@ function subscribe () {
 // Subscribe to a compressed image topic and draw to a canvas by id
 // rotation: 0 | 90 | 180 | 270 (degrees clockwise)
 // swap: null | [a, b] — swap pixel channels a and b (0=R,1=G,2=B) e.g. [0,1] fixes R↔G
-function subCamImage (topic, canvasId, sigId, rotation = 0, swap = null) {
+function subCamImage (topic, canvasId, sigId, rotation = 0, swap = null, opts = {}) {
   if (!canvasId) return
-  sub(topic, 'sensor_msgs/CompressedImage', m => {
+  return sub(topic, 'sensor_msgs/CompressedImage', m => {
     const canvas = $(canvasId)
     if (!canvas) return
     try {
@@ -633,7 +824,7 @@ function subCamImage (topic, canvasId, sigId, rotation = 0, swap = null) {
         if (sigId) { const s = $(sigId); if (s) { s.textContent = 'LIVE'; s.className = 'cam-sig ok' } }
       }).catch(() => {})
     } catch (_) {}
-  })
+  }, opts)
 }
 
 // ── history helper ────────────────────────────────────────────────────────────
@@ -652,51 +843,34 @@ function pushSlamTrail () {
 }
 
 // ── Services panel ────────────────────────────────────────────────────────────
-// "camera" UI button controls both 'camera' and 'mjpeg' services on the Pi
-const SVC_UI = ['slam', 'camera', 'mavros', 'brain', 'barcode']
+const SVC_UI = ['mavros', 'brain', 'barcode']
 
 function updateSvcUI () {
   SVC_UI.forEach(svc => {
     const dot = $('svc-dot-' + svc)
     const btn = $('svc-btn-' + svc)
     if (!dot || !btn) return
-    // CAMERA button reflects camera + camera2 + mjpeg
-    const isRunning = svc === 'camera'
-      ? ['camera','camera2','mjpeg'].some(k => S.svcStatus[k] === 'running')
-      : S.svcStatus[svc] === 'running'
+    const isRunning = S.svcStatus[svc] === 'running'
     dot.className = 'svc-dot' + (isRunning ? ' running' : '')
     btn.textContent = isRunning ? 'Stop' : 'Start'
     btn.className   = 'svc-btn' + (isRunning ? ' running' : '')
   })
 }
 
-let _svcPub = null
 function toggleService (svc) {
   if (!ros || ros.isConnected === false) return
-  if (!_svcPub) {
-    _svcPub = new ROSLIB.Topic({ ros, name: '/gcs/cmd', messageType: 'std_msgs/String' })
-  }
-  // CAMERA button controls forward cam, downward cam, and MJPEG server together
-  const group = svc === 'camera' ? ['camera', 'camera2', 'mjpeg'] : [svc]
-  const isRunning = group.some(k => S.svcStatus[k] === 'running')
-  const action = isRunning ? 'stop' : 'start'
-
-  // Barcode needs camera running — auto-start camera services when starting barcode
-  if (svc === 'barcode' && action === 'start') {
-    ;['camera', 'camera2', 'mjpeg'].forEach(s => {
-      if (S.svcStatus[s] !== 'running') {
-        _svcPub.publish(new ROSLIB.Message({ data: JSON.stringify({ action: 'start', service: s }) }))
-      }
-    })
-  }
-
-  group.forEach(s => {
-    _svcPub.publish(new ROSLIB.Message({ data: JSON.stringify({ action, service: s }) }))
-  })
+  const action = S.svcStatus[svc] === 'running' ? 'stop' : 'start'
+  rosPub('/gcs/cmd', 'std_msgs/String', { data: JSON.stringify({ action, service: svc }) })
 }
 
 // ── DOM updates (text/badges) ─────────────────────────────────────────────────
 function updateDOM () {
+  // Kinetix bridge silent for 3 s (status is 1 Hz): offline, nothing to press
+  if (Date.now() - S.kinetixTs > 3000) {
+    $('kx-bridge').textContent = 'offline'
+    $('kx-bridge').className   = 'sv danger'
+    ;['btn-kx-run', 'btn-kx-abort', 'btn-kx-sfm'].forEach(id => { $(id).disabled = true })
+  }
   // header badges
   const armEl = $('hdr-armed')
   armEl.textContent = S.armed ? 'ARMED' : 'DISARMED'
@@ -725,7 +899,7 @@ function updateDOM () {
   pillMode.className   = 'pill active'
 
   document.querySelectorAll('.mode-btn').forEach(b => {
-    b.classList.toggle('active', b.dataset.mode === S.mode)
+    b.classList.toggle('active', fcuMode(b.dataset.mode) === S.mode)
   })
 
   // brain mission status badge
@@ -1467,7 +1641,7 @@ function decodePC2xyz (msg) {
   return { data: out, count: n / 3 }
 }
 
-// ── SLAM 3D WebGL point-cloud renderer (Point-LIO / Unitree L2) ──────────────
+// ── SLAM 3D WebGL point-cloud renderer (ZED spatial map) ─────────────────────
 const SLAM3D = (() => {
   const MAX = 800000   // ring-buffer capacity (~11 min at 1200 pts/s)
   let gl = null, prog = null, bufPos = null, bufCol = null
@@ -1635,7 +1809,8 @@ const SLAM3D = (() => {
     }
   }
 
-  return { init, addScan, render, clearMap, cam, get count () { return Math.min(total, MAX) } }
+  return { init, addScan, render, clearMap, cam, points: () => posArr.subarray(0, Math.min(total, MAX) * 3),
+           get count () { return Math.min(total, MAX) } }
 })()
 
 function drawSLAM () {
@@ -1661,9 +1836,9 @@ function drawSLAM () {
       ctx2.fillStyle = 'rgba(42,48,64,.85)'
       ctx2.fillRect(W/2-200, H/2-30, 400, 60)
       ctx2.fillStyle = '#5a6072'; ctx2.font = '13px sans-serif'; ctx2.textAlign = 'center'
-      ctx2.fillText('Waiting for /cloud_registered…', W/2, H/2-8)
+      ctx2.fillText('Waiting for the ZED map (' + MAP_TOPIC + ')…', W/2, H/2-8)
       ctx2.fillStyle = '#3a4050'; ctx2.font = '11px sans-serif'
-      ctx2.fillText('ros2 launch point_lio mapping_unilidar_l2.launch.py', W/2, H/2+14)
+      ctx2.fillText('needs ZED spatial mapping + zed_map_relay.py', W/2, H/2+14)
     }
   }
 }

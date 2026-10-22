@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
 Brain node — autonomous mission planner.
-Reads waypoints from SQLite, tracks position via LiDAR-SLAM odometry,
-streams setpoints to MAVROS, and publishes the planned path for the GCS map.
+Reads waypoints from SQLite, tracks position via the flight controller's EKF
+(MAVROS local_position, fused with ZED VIO), streams setpoints to MAVROS in that
+same frame, and publishes the planned path for the GCS map.
 
-Launch alongside the GCS stack (start_gcs.sh passes --brain flag).
+MAVROS names are relative: run it in the drone's namespace
+(`--ros-args -r __ns:=/drone_1` against bisg_isaac). Started from the dashboard
+(gcs_control) or by start_all.sh --brain.
 """
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
+from rclpy.qos import qos_profile_sensor_data
 import sqlite3
 import json
 import math
 import os
 
-from nav_msgs.msg    import Odometry
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import NavSatFix
 from std_msgs.msg    import String
@@ -40,10 +44,11 @@ class BrainNode(Node):
         self.wp_idx  = 0
         self.done    = False
 
-        self.create_subscription(Odometry,  '/Odometry',                      self._on_odom, 10)
-        self.create_subscription(NavSatFix, '/mavros/global_position/global', self._on_gps,  10)
+        # MAVROS publishes these best-effort — a reliable subscriber would get nothing
+        self.create_subscription(PoseStamped, 'mavros/local_position/pose',     self._on_pose, qos_profile_sensor_data)
+        self.create_subscription(NavSatFix,   'mavros/global_position/global',  self._on_gps,  qos_profile_sensor_data)
 
-        self._pub_sp   = self.create_publisher(PoseStamped, '/mavros/setpoint_position/local', 10)
+        self._pub_sp   = self.create_publisher(PoseStamped, 'mavros/setpoint_position/local', 10)
         self._pub_path = self.create_publisher(String,      '/brain/planned_path',             10)
 
         self.create_timer(0.1,  self._tick)         # 10 Hz control loop
@@ -114,8 +119,8 @@ class BrainNode(Node):
 
     # ── subscribers ───────────────────────────────────────────────────────────
 
-    def _on_odom(self, msg):
-        p = msg.pose.pose.position
+    def _on_pose(self, msg):
+        p = msg.pose.position
         self.slam_x = p.x
         self.slam_y = p.y
 
@@ -164,11 +169,11 @@ def main():
     node = BrainNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):   # Ctrl+C / SIGTERM
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()   # SIGTERM may have shut the context down already
 
 
 if __name__ == '__main__':

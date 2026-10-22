@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-barcode_detector.py — ROS2 node: detects barcodes / QR codes in the forward
-camera, draws ROI boxes + SLAM overlay, and publishes results to the GCS.
+barcode_detector.py — ROS2 node: detects barcodes / QR codes in the ZED left
+camera, draws ROI boxes + pose overlay, and publishes results to the GCS.
+
+Inputs are relative names: run it in the drone's namespace
+(`--ros-args -r __ns:=/drone_1` next to bisg_isaac's ZED stack).
 
 Subscribes:
-  /camera/forward/image_raw/compressed  sensor_msgs/CompressedImage
-  /Odometry                             nav_msgs/Odometry   (SLAM pose)
-  /tf                                   tf2_msgs/TFMessage  (fallback)
+  zed/zed_node/left/color/rect/image/compressed  sensor_msgs/CompressedImage
+  zed/zed_node/odom                              nav_msgs/Odometry   (ZED VIO pose)
 
 Publishes:
   /barcode/roi/image/compressed  sensor_msgs/CompressedImage
@@ -14,7 +16,7 @@ Publishes:
   /barcode/detection             std_msgs/String
       → JSON {barcode, code, status, slam_x, slam_y, slam_theta}
 
-Install dependencies (run once on Pi):
+Install dependencies (the Docker image has them):
   sudo apt install -y libzbar0
   pip3 install --break-system-packages pyzbar opencv-python
 """
@@ -22,11 +24,12 @@ Install dependencies (run once on Pi):
 import json, math, time
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from std_msgs.msg import String
 from sensor_msgs.msg import CompressedImage
 
-# Must match camera_publisher.py QoS (BEST_EFFORT) — otherwise subscriber gets nothing
+# Best-effort, depth 1: matches any publisher and never queues stale frames
 CAM_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     durability=DurabilityPolicy.VOLATILE,
@@ -71,14 +74,11 @@ class BarcodeDetector(Node):
 
         # ── Subscribers ───────────────────────────────────────────────────────
         self.create_subscription(
-            CompressedImage, '/camera/forward/image_raw/compressed',
+            CompressedImage, 'zed/zed_node/left/color/rect/image/compressed',
             self._on_image, CAM_QOS)
 
         from nav_msgs.msg import Odometry
-        self.create_subscription(Odometry, '/Odometry', self._on_odom, 10)
-
-        from tf2_msgs.msg import TFMessage
-        self.create_subscription(TFMessage, '/tf', self._on_tf, 10)
+        self.create_subscription(Odometry, 'zed/zed_node/odom', self._on_odom, 10)
 
         # Throttle: only process 1 frame per N seconds to save CPU
         self._last_proc = 0.0
@@ -91,7 +91,7 @@ class BarcodeDetector(Node):
         self.get_logger().info(
             f'barcode_detector ready  cv2={CV2}  pyzbar={PYZBAR}')
 
-    # ── SLAM pose from /Odometry ──────────────────────────────────────────────
+    # ── pose from ZED odometry ──────────────────────────────────────────────────
     def _on_odom(self, msg):
         p = msg.pose.pose
         self._slam_x = p.position.x
@@ -101,19 +101,6 @@ class BarcodeDetector(Node):
         self._slam_theta = math.degrees(math.atan2(
             2 * (q.w * q.z + q.x * q.y),
             1 - 2 * (q.y * q.y + q.z * q.z)))
-
-    # ── SLAM pose fallback from /tf ───────────────────────────────────────────
-    def _on_tf(self, msg):
-        for tr in (msg.transforms or []):
-            if (tr.header.frame_id == 'camera_init' and
-                    tr.child_frame_id == 'aft_mapped'):
-                p = tr.transform.translation
-                q = tr.transform.rotation
-                self._slam_x = p.x
-                self._slam_y = p.y
-                self._slam_theta = math.degrees(math.atan2(
-                    2 * (q.w * q.z + q.x * q.y),
-                    1 - 2 * (q.y * q.y + q.z * q.z)))
 
     # ── Main image callback ───────────────────────────────────────────────────
     def _on_image(self, msg: CompressedImage):
@@ -202,11 +189,11 @@ def main():
     node = BarcodeDetector()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):   # Ctrl+C / SIGTERM
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()   # SIGTERM may have shut the context down already
 
 
 if __name__ == '__main__':
