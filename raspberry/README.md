@@ -1,6 +1,6 @@
 # raspberry/ — Onboard Software Stack
 
-All Python nodes and shell scripts that run on the drone's companion computer (the folder name is from the Raspberry Pi version). They sit on top of two things that run separately:
+All Python nodes and shell scripts that run on the drone's companion computer (a Raspberry Pi or a Jetson; the folder name is just from the Raspberry Pi version). They sit on top of two things that run separately:
 
 - the **ZED SDK ROS 2 wrapper** (`zed_node`) — camera, visual odometry, spatial mapping. It needs the ZED SDK and CUDA (a Jetson); in the bisg_isaac sim and on its drone it is bisg_isaac's ZED stack, at `/drone_1/zed/zed_node`.
 - **MAVROS** — either started from here (`mavros_launch.sh`) or, with bisg_isaac, its own `px4-bridge` service at `/drone_1/mavros`.
@@ -54,8 +54,14 @@ The GCS app sends `{"action":"start","service":"barcode"}` — this node starts 
 
 ---
 
+### `mavros_streams.py` — telemetry stream rates
+Asks the flight controller (through `mavros/set_stream_rate`) for the telemetry MAVROS does not request on its own, again after every FCU reconnect. On the drone it starts with MAVROS (`mavros_launch.sh`, all streams). Against a MAVROS that is not ours (the bisg_isaac sim) `rosbridge_boot.sh` starts it with `MAVROS_STREAMS=rc`, which requests only the motor outputs (`SERVO_OUTPUT_RAW` → `mavros/rc/out`) the dashboard's motor knobs show. That MAVROS must load the `rc_io` plugin (bisg_isaac `docker/ros/mavros_lean.yaml`, restart `bisg-mavros` after adding it).
+
+### `zed_image_relay.py` — ZED depth + confidence for the GCS Image tab
+The wrapper's `depth_registered` and `confidence_map` are raw 32-bit float images (3.7 MB each at 720p), far too much for rosbridge or a phone. This node colour-maps them (turbo), shrinks them to 480 px wide and republishes JPEG `CompressedImage`s at up to 4 Hz: `gcs/depth/compressed` (blue near … red far, 0.3–10 m, black = no return) and `gcs/confidence/compressed` (blue reliable … red unreliable; the ZED's map is 0–100, higher = less reliable). Like the map relay it reads the ZED topics **only while its output has a subscriber**. The RGB panel needs no relay (the wrapper's own `left/color/rect/image/compressed`). The same node also turns the sim's `chase/image` (raw rgb8, sim only) into `gcs/chase/compressed` at up to `chase_rate_hz` (8) for the Kinetix tab's live view. Parameters: `width`, `rate_hz`, `min_depth`, `max_depth`, `quality`. Started by `rosbridge_boot.sh` / `start_all.sh`; rebuild the image after changing it (it is baked in).
+
 ### `zed_map_relay.py` — ZED Map for the GCS
-The ZED wrapper's `mapping/fused_cloud` carries the whole map in every message — in the bisg warehouse 4.2 M points, 68 MB, once a second, far too much for rosbridge. This node voxel-downsamples it to xyz float32 and republishes it as `gcs/map_cloud` at most every 2 s (~120 k points, ~0.6 MB/s through rosbridge).
+The ZED wrapper's `mapping/fused_cloud` carries the whole map in every message — in the bisg warehouse 4.2 M points, 68 MB, once a second, far too much for rosbridge. This node voxel-downsamples it and republishes it as `gcs/map_cloud` at most every 2 s (~120 k points, ~0.6 MB/s through rosbridge). The points keep the ZED's camera colour: x, y, z float32 plus the packed `rgb` (4 bytes in memory order B, G, R, A, passed through untouched), so the map arrives coloured. The image bakes `raspberry/` in: after changing this file, rebuild (`docker compose -f docker/compose.yaml --profile bisg build gcs-bisg`, then `docker/bisg_up.sh`).
 
 It subscribes to the fused cloud **only while `gcs/map_cloud` has a subscriber**, so the ZED stack ships nothing when no GCS has the map open. Started by `rosbridge_boot.sh` / `start_all.sh`.
 
@@ -73,10 +79,9 @@ Backend of the GCS **Kinetix** tab. Runs in the `kinetix:jazzy` image with the K
 | Command (`/gcs/kinetix/cmd`) | Runs |
 |---|---|
 | `{"action":"run","scene":"warehouse_room","method":"tour","seed":0}` | `python3 -m kinetix run --scene config/scenes/<scene>.yaml --method <m> --rig mavros --seed <n>` |
-| `{"action":"sfm","run":"<run id>"}` (no run = newest) | `python3 -m kinetix sfm runs/<run>` |
 | `{"action":"abort"}` | SIGINT to the job = Kinetix's Ctrl+C: fly home at a safe height, AUTO.LAND, disarm |
 
-`run` is refused while anything else publishes `<DRONE_NS>/mavros/setpoint_position/local` — Kinetix streams the setpoints itself and only one producer may run per drone. Status (`/gcs/kinetix/status`, 1 Hz JSON): state (`idle`, `flying`, `aborting`, `reconstructing`), job, log tail, scenes, methods, recent runs with `run.yaml` summary and `sfm/offline/metrics.json`, other setpoint producers, last message.
+`run` is refused while anything else publishes `<DRONE_NS>/mavros/setpoint_position/local` — Kinetix streams the setpoints itself and only one producer may run per drone. Status (`/gcs/kinetix/status`, 1 Hz JSON): state (`idle`, `flying`, `aborting`), job, log tail, scenes, methods, recent runs with the `run.yaml` summary, `plan` (the active or newest run's planned viewpoints from `steps.jsonl`, its flown path from `frames.jsonl` and the scene's room box, all in the scene's map frame), other setpoint producers, last message. The GCS does no post-processing (no SfM).
 
 ---
 
@@ -84,7 +89,7 @@ Backend of the GCS **Kinetix** tab. Runs in the `kinetix:jazzy` image with the K
 Subscribes to the ZED left image (JPEG), runs **pyzbar** barcode/QR detection on every frame (throttled to 4 fps to save CPU), and for each new detection:
 
 1. Draws a green polygon + label overlay on the frame
-2. Stamps the detection with the current **SLAM position** (x, y, z, θ) from the ZED odometry
+2. Stamps the detection with the current position (x, y, z, θ) from the ZED visual odometry
 3. Publishes a JSON detection event on `/barcode/detection`
 4. Publishes the annotated image on `/barcode/roi/image/compressed`
 

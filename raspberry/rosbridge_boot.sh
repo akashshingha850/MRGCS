@@ -24,6 +24,17 @@ echo "[boot] Starting ZED map relay (ns ${DRONE_NS:-/}) ..."
 python3 "$SCRIPT_DIR/zed_map_relay.py" "${NS_ARGS[@]}" &
 RELAY_PID=$!
 
+echo "[boot] Starting ZED image relay (depth + confidence JPEGs, ns ${DRONE_NS:-/}) ..."
+python3 "$SCRIPT_DIR/zed_image_relay.py" "${NS_ARGS[@]}" &
+IMG_RELAY_PID=$!
+
+# Against a sim/drone MAVROS that is not ours (DRONE_NS set): ask PX4 for the motor outputs the dashboard knobs show
+if [[ -n "${DRONE_NS:-}" ]]; then
+  echo "[boot] Requesting motor-output streams from the FCU (ns $DRONE_NS) ..."
+  MAVROS_STREAMS=rc python3 "$SCRIPT_DIR/mavros_streams.py" "${NS_ARGS[@]}" &
+  STREAMS_PID=$!
+fi
+
 # The GCS app is plain static files: any browser can run it, no install
 WEB_PID=""
 if [[ -n "${GCS_WEB_PORT:-}" ]]; then
@@ -33,7 +44,7 @@ if [[ -n "${GCS_WEB_PORT:-}" ]]; then
 fi
 
 # Stop them all when this script exits (systemd stop / reboot / crash)
-trap "kill $BRIDGE_PID $RELAY_PID $WEB_PID 2>/dev/null; wait" EXIT INT TERM
+trap "kill $BRIDGE_PID $RELAY_PID $WEB_PID $STREAMS_PID $IMG_RELAY_PID 2>/dev/null; wait" EXIT INT TERM
 
 # Give rosbridge a moment to bind before the control node tries to publish
 sleep 3

@@ -15,7 +15,7 @@
 #                             ROS_DOMAIN_ID=<sim domain> DRONE_NS=/drone_1 docker compose -f docker/compose.yaml --profile bisg up -d gcs-bisg
 #
 #   kinetix     (profile)   kinetix_bridge.py in the kinetix:jazzy image, with the Kinetix repo (KINETIX_DIR, default
-#                           ../../kinetix next to this repo): the GCS Kinetix tab's buttons (scan, abort → land, reconstruct).
+#                           ../../kinetix next to this repo): the GCS Kinetix tab's buttons (scan, abort → land; plan + result view).
 #                           docker/bisg_up.sh starts it when the image and the repo exist.
 #
 # Both use the host network: DDS discovery and the WebSocket port are the host's.

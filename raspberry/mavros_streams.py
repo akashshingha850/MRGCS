@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """
-mavros_streams.py — request ArduCopter telemetry streams through MAVROS.
+mavros_streams.py — request telemetry streams through MAVROS.
 
 ArduCopter only sends telemetry on a serial port when asked (or when the SRx_
 parameters for that port are set). MAVROS does not request streams on its own,
-so this node calls /mavros/set_stream_rate every time /mavros/state reports a
+so this node calls mavros/set_stream_rate every time mavros/state reports a
 new FCU connection — including after a Pixhawk reboot.
 
-Started alongside MAVROS by mavros_launch.sh.
+Started alongside MAVROS by mavros_launch.sh. Against a MAVROS that is not ours (the bisg_isaac sim) rosbridge_boot.sh
+starts it with MAVROS_STREAMS=rc in the drone's namespace: PX4 does not stream the motor outputs (SERVO_OUTPUT_RAW ->
+mavros/rc/out, the dashboard's motor knobs) unless asked, and the MAVROS there must load the rc_io plugin
+(bisg_isaac docker/ros/mavros_lean.yaml).
 
-Subscribes:  /mavros/state            mavros_msgs/State
-Calls:       /mavros/set_stream_rate  mavros_msgs/srv/StreamRate
+Environment: MAVROS_STREAMS  all (default: every stream below) | rc (only the motor outputs: the rest is already flowing)
+Names are relative: run with `--ros-args -r __ns:=/drone_1` for a namespaced MAVROS.
+
+Subscribes:  mavros/state            mavros_msgs/State
+Calls:       mavros/set_stream_rate  mavros_msgs/srv/StreamRate
 """
+import os
 
 import rclpy
 from rclpy.node import Node
@@ -28,6 +35,8 @@ STREAMS = [
     (StreamRate.Request.STREAM_POSITION,     5),  # GLOBAL_POSITION   → /mavros/global_position/*
     (StreamRate.Request.STREAM_RC_CHANNELS,  4),  # SERVO_OUTPUT_RAW  → /mavros/rc/out
 ]
+if os.environ.get('MAVROS_STREAMS', 'all') == 'rc':
+    STREAMS = [s for s in STREAMS if s[0] == StreamRate.Request.STREAM_RC_CHANNELS]
 
 
 class MavrosStreams(Node):
@@ -36,10 +45,10 @@ class MavrosStreams(Node):
         super().__init__('mavros_streams')
         self._connected = False
         self._requested = False
-        self._cli = self.create_client(StreamRate, '/mavros/set_stream_rate')
+        self._cli = self.create_client(StreamRate, 'mavros/set_stream_rate')
         # /mavros/state is published transient-local
         qos = QoSProfile(depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        self.create_subscription(State, '/mavros/state', self._on_state, qos)
+        self.create_subscription(State, 'mavros/state', self._on_state, qos)
         # Retry until the service is discovered; re-arms after each disconnect
         self.create_timer(1.0, self._tick)
 

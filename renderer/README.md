@@ -1,6 +1,6 @@
 # renderer/ — GCS Frontend (Electron)
 
-The Drone GCS user interface — a single-page Electron renderer that connects to the Raspberry Pi over a rosbridge WebSocket and visualises all telemetry, video, and sensor data in real time.
+The Drone GCS user interface — a single-page Electron renderer that connects to the drone's companion computer (Raspberry Pi or Jetson) over a rosbridge WebSocket and visualises all telemetry, video, and sensor data in real time.
 
 No ROS installation is required on the operator's laptop. The app runs on **Windows, Linux, and macOS**.
 
@@ -13,11 +13,11 @@ Defines the four-tab layout, all panel structure, and global styles. Tabs:
 
 | Tab | Content |
 |---|---|
-| **DASHBOARD** | Live ZED camera, NAV map, ARM/DISARM, service controls, battery, motors |
+| **DASHBOARD** | Live ZED camera, NAV map, ARM/DISARM, service controls, battery, quadcopter motor knobs (X frame, PX4 order M1 front-right, M2 rear-left, M3 front-left, M4 rear-right; thrust shown by the arc and needle, no numbers) |
 | **NAVIGATION** | Artificial horizon, compass, altitude/speed/vspeed charts, flight data table |
-| **SLAM** | ZED spatial map (WebGL point cloud), ZED VIO pose, mapping on/off, PCD export |
-| **IMAGE PROCESSING** | Barcode camera stream, detection inventory list, DB log, volumetry panel |
-| **KINETIX** | Whole-room photogrammetry: start a scan (scene / method / seed), abort → land, reconstruct, live log, recent runs with SfM metrics (`/gcs/kinetix/*`, `kinetix_bridge.py`) |
+| **SLAM** | Visual-inertial SLAM from the ZED stereo camera (no lidar): spatial map as a WebGL point cloud, ZED VIO pose, mapping on/off, PCD export |
+| **IMAGE PROCESSING** | ZED RGB, depth and confidence images (depth / confidence as JPEGs from `zed_image_relay.py`), the barcode camera, detection inventory list, DB log, volumetry panel |
+| **KINETIX** | Whole-room photogrammetry: start a scan (scene / method / seed / explore-first), abort → land, live log, live flight panel (ZED left image, FCU / battery / ZED health, distance / speed / height / yaw error vs Kinetix's capture tolerances, 30 s plot), plan & result map (planned viewpoints, captured path, room box, live drone / trail / setpoint), recent runs (`/gcs/kinetix/*`, `kinetix_bridge.py`) |
 
 ---
 
@@ -33,7 +33,7 @@ Every 5 s the app lists the topics through rosapi and takes the namespaces from 
 
 #### Dashboard
 - **ARM / DISARM / mode buttons** → call `/mavros/cmd/arming` / `/mavros/set_mode`; the command log shows the service result (OK / FAIL)
-- **TAKEOFF / LAND / RTL** → call `/mavros/cmd/takeoff` / `/mavros/cmd/land` / `/mavros/set_mode`
+- **TAKEOFF / LAND / RTL** → ArduCopter: `/mavros/cmd/takeoff` / `/mavros/cmd/land` / `/mavros/set_mode`. PX4: `MAV_CMD_NAV_TAKEOFF` takes an AMSL altitude, which a GPS-denied vehicle does not have, so TAKEOFF sets `MIS_TAKEOFF_ALT` from the Alt field (1-50 m above where it is, `/mavros/param/set`) and enters `AUTO.TAKEOFF` (the vehicle must be armed first; the Alt field is a height above the take-off point); LAND is `AUTO.LAND`, RTL `AUTO.RTL`
 - **Live camera (`ZED — Left`)** → `<ZED_NS>/left/color/rect/image/compressed` (JPEG) drawn on a canvas, throttled by rosbridge to 10 fps (~2 MB/s at HD1080)
 - **NAV map** → Canvas drawn at 20 Hz from `/brain/planned_path`; shows real path (blue), planned waypoints (dashed yellow), drone arrow
 - **Service panel** → subscribes to `/gcs/status`, publishes to `/gcs/cmd` on button click.
@@ -45,10 +45,11 @@ Every 5 s the app lists the topics through rosapi and takes the namespaces from 
 - **Compass rose** → SVG-style Canvas, heading from `/mavros/vfr_hud`
 - **Charts** → Chart.js rolling 60-sample window for altitude, airspeed, vertical speed
 
-#### SLAM
-- **Point cloud** → `<ns>/gcs/map_cloud`, the ZED spatial map downsampled on board by `zed_map_relay.py` (each message is the whole map and replaces the view). Points coloured by height using a red→yellow→green→blue gradient
+#### SLAM (visual-inertial, ZED camera — no lidar)
+- **Point cloud** → `<ns>/gcs/map_cloud`, the ZED spatial map downsampled on board by `zed_map_relay.py` (each message is the whole map and replaces the view). Points are drawn in the camera's colour (`rgb`, bytes B,G,R,A); the *Colour* button switches to a height ramp scaled to the map's 2nd–98th percentile of z. The camera frames the map on the first message and again on Clear Map
 - **Pose** → `<ZED_NS>/odom` (ZED visual odometry), also drives the Dashboard NAV map
-- **Controls** → Map On / Off: `<ZED_NS>/enable_mapping` (`std_srvs/SetBool`); Reset Pose: `<ZED_NS>/reset_pos_tracking` (`std_srvs/Trigger`), refused while armed — the flight controller fuses the ZED odometry, so a reset in flight is a position jump; Save Map: downloads the map on screen as an ASCII `.pcd`; Clear Map: clears the view until the next map arrives
+- **Controls** → Map On / Off: `<ZED_NS>/enable_mapping` (`std_srvs/SetBool`); Reset Pose: `<ZED_NS>/reset_pos_tracking` (`std_srvs/Trigger`), refused while armed — the flight controller fuses the ZED odometry, so a reset in flight is a position jump; Save Map: downloads the map on screen as an ASCII `.pcd` (with `rgb` when the map has colour); Clear Map: clears the view until the next map arrives
+- **Touch** → one finger rotates the 3D view, two fingers pinch-zoom and pan (mouse: drag to rotate, right-drag to pan, wheel to zoom)
 
 #### Image Processing
 - **Barcode camera** → ROS topic `/barcode/roi/image/compressed` decoded from base64 JPEG
@@ -91,7 +92,15 @@ MAVROS names are shown under `/mavros`; the prefix is whatever namespace was det
 
 ## Running as a web page
 
-The renderer needs nothing from Electron (`preload.js` bridges nothing), so it also runs in any browser. The onboard container serves it on `:8090`; served over http(s), the default rosbridge URL is `ws://<page host>:9090`.
+The renderer needs nothing from Electron (`preload.js` bridges nothing), so it also runs in any browser. The onboard container serves it on `:8090`; served over http(s), the default rosbridge URL is `ws://<page host>:9090`. Any device on the same network or Tailscale tailnet can open `http://<host or Tailscale IP>:8090`.
+
+### Opening a tab directly
+
+`http://<host>:8090/?tab=kinetix` (also `dashboard`, `navigation`, `slam`, `image`) opens that tab on load, e.g. as a phone bookmark.
+
+### Phone layout
+
+Below 900 px width (`@media (max-width: 900px)` at the end of the `<style>` block in `index.html`) the shell becomes one scrolling column: the top bar keeps the logo and connection badges on one row and the tabs on a swipeable row below, every tab stacks its panels vertically, and each canvas gets an explicit height (canvases are sized from their parent, so they need one). Inputs are 16 px so iOS Safari does not zoom on focus, and `touch-action: manipulation` disables double-tap zoom so the double-tap on ARM and Start scan works. The desktop layout is unchanged above 900 px.
 
 ## ROS Topics Published
 
@@ -108,6 +117,7 @@ The renderer needs nothing from Electron (`preload.js` bridges nothing), so it a
 |---|---|---|
 | `/mavros/cmd/arming` | `mavros_msgs/CommandBool` | ARM, DISARM |
 | `/mavros/set_mode` | `mavros_msgs/SetMode` | Mode buttons, RTL, HOLD |
-| `/mavros/cmd/takeoff` | `mavros_msgs/CommandTOL` | TAKEOFF |
+| `/mavros/cmd/takeoff` | `mavros_msgs/CommandTOL` | TAKEOFF (ArduCopter) |
+| `/mavros/param/set` | `mavros_msgs/ParamSetV2` | TAKEOFF (PX4: `MIS_TAKEOFF_ALT`, then mode `AUTO.TAKEOFF`) |
 | `/mavros/cmd/land` | `mavros_msgs/CommandTOL` | LAND |
 | `/gcs/cmd` | `std_msgs/String` (JSON) | Start/stop service buttons |

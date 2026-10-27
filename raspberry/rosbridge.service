@@ -1,6 +1,6 @@
 # rosbridge.service — auto-start rosbridge + GCS control node on every boot.
 #
-# INSTALL (run once on the Raspberry Pi):
+# INSTALL (run once on the companion computer — Raspberry Pi or Jetson):
 #   chmod +x ~/drone-gcs/raspberry/rosbridge_boot.sh
 #   sudo cp ~/drone-gcs/raspberry/rosbridge.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
@@ -25,6 +25,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# User/Group/paths below are the Raspberry Pi's: change raspi5 to your user (e.g. the Jetson's)
 User=raspi5
 Group=raspi5
 WorkingDirectory=/home/raspi5

@@ -1,7 +1,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # drone-gcs.service — systemd unit: auto-start GCS stack on every boot
 #
-# INSTALL (run once on the Raspberry Pi):
+# INSTALL (run once on the companion computer — Raspberry Pi or Jetson):
 #
 #   1. Copy to systemd:
 #        sudo cp ~/drone-gcs/raspberry/drone-gcs.service /etc/systemd/system/

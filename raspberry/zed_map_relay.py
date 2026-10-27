@@ -4,7 +4,8 @@ zed_map_relay.py — ZED spatial-mapping cloud, cut down for the GCS.
 
 The ZED wrapper's mapping/fused_cloud is the whole map in one message (millions
 of points, ~70 MB at 5 cm voxels, 1 Hz) — far too much for rosbridge. This node
-voxel-downsamples it to xyz float32 and republishes it at most every `period` s.
+voxel-downsamples it (xyz float32, plus the ZED's packed `rgb` colour when the cloud has it) and
+republishes it at most every `period` s.
 
 It subscribes to the fused cloud only while something (rosbridge for the GCS)
 subscribes to gcs/map_cloud, so an idle GCS costs the ZED stack nothing.
@@ -13,7 +14,7 @@ Topic names are relative: run it in the drone's namespace
 (`--ros-args -r __ns:=/drone_1` next to bisg_isaac's ZED stack).
 
 Subscribes:  zed/zed_node/mapping/fused_cloud  sensor_msgs/PointCloud2  (frame map)
-Publishes:   gcs/map_cloud                     sensor_msgs/PointCloud2  xyz float32, same frame
+Publishes:   gcs/map_cloud                     sensor_msgs/PointCloud2  xyz float32 (+ rgb, 4 bytes B,G,R,A like the input), same frame
 
 Parameters:
   voxel       0.2      m — downsampling grid (the bisg warehouse: ~4.2 M → ~120 k points)
@@ -42,6 +43,7 @@ XYZ_FIELDS = [
     PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
     PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
 ]
+RGB_FIELD = PointField(name='rgb', offset=12, datatype=PointField.FLOAT32, count=1)   # packed colour, bytes kept as received
 
 
 class ZedMapRelay(Node):
@@ -87,7 +89,12 @@ class ZedMapRelay(Node):
         xyz = np.empty((n, 3), dtype=np.float32)
         for i, k in enumerate('xyz'):
             xyz[:, i] = rows[:, off[k]:off[k] + 4].copy().view(np.float32).ravel()
-        xyz = xyz[np.isfinite(xyz).all(axis=1)]
+        # the colour travels as raw bytes (a float32 field holding packed B,G,R,A; never read as a number)
+        rgb = rows[:, off['rgb']:off['rgb'] + 4].copy().view('<u4').ravel() if 'rgb' in off else None
+        finite = np.isfinite(xyz).all(axis=1)
+        xyz = xyz[finite]
+        if rgb is not None:
+            rgb = rgb[finite]
         if len(xyz) == 0:
             return
 
@@ -97,24 +104,27 @@ class ZedMapRelay(Node):
         dims = keys.max(axis=0) + 1
         lin = (keys[:, 0] * dims[1] + keys[:, 1]) * dims[2] + keys[:, 2]
         _, first = np.unique(lin, return_index=True)
-        xyz = xyz[first]
-        voxels = len(xyz)
-        if len(xyz) > self._max:
-            xyz = xyz[np.random.default_rng().choice(len(xyz), self._max, replace=False)]
+        if len(first) > self._max:
+            first = np.random.default_rng().choice(first, self._max, replace=False)
+        voxels = len(first)
+        pts = np.empty(len(first), dtype=[('x', '<f4'), ('y', '<f4'), ('z', '<f4')] + ([('rgb', '<u4')] if rgb is not None else []))
+        pts['x'], pts['y'], pts['z'] = xyz[first, 0], xyz[first, 1], xyz[first, 2]
+        if rgb is not None:
+            pts['rgb'] = rgb[first]
 
         out = PointCloud2()
         out.header       = msg.header
         out.height       = 1
-        out.width        = len(xyz)
-        out.fields       = XYZ_FIELDS
+        out.width        = len(pts)
+        out.fields       = XYZ_FIELDS + ([RGB_FIELD] if rgb is not None else [])
         out.is_bigendian = False
-        out.point_step   = 12
-        out.row_step     = 12 * len(xyz)
+        out.point_step   = pts.dtype.itemsize
+        out.row_step     = out.point_step * len(pts)
         out.is_dense     = True
-        out.data         = xyz.tobytes()
+        out.data         = pts.tobytes()
         self._pub.publish(out)
         self.get_logger().info(
-            f'map {n} points → {voxels} voxels → {len(xyz)} sent in {time.monotonic() - now:.2f} s',
+            f'map {n} points → {voxels} voxels → {len(pts)} sent in {time.monotonic() - now:.2f} s',
             throttle_duration_sec=30.0)
 
 

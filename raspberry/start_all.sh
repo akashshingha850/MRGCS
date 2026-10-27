@@ -97,6 +97,11 @@ python3 "$SCRIPT_DIR/zed_map_relay.py" "${NS_ARGS[@]}" \
   > "$LOG_DIR/map_relay.log" 2>&1 &
 PIDS[map_relay]=$!
 
+log "Starting ZED image relay (depth + confidence for the GCS Image tab)"
+python3 "$SCRIPT_DIR/zed_image_relay.py" "${NS_ARGS[@]}" \
+  > "$LOG_DIR/image_relay.log" 2>&1 &
+PIDS[image_relay]=$!
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. MAVROS — flight-controller bridge (disabled unless --mavros PORT given)
 # ─────────────────────────────────────────────────────────────────────────────

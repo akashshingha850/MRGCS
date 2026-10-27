@@ -2,7 +2,8 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Drone GCS</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>mavros gcs</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -113,16 +114,39 @@
     #view-kinetix { height:calc(100vh - var(--topbar)); }
     #view-kinetix.active { display:grid !important; grid-template-columns:300px 1fr; }
     #kx-side { background:var(--panel); border-right:1px solid var(--border); overflow-y:auto; }
-    #kx-main { display:flex; flex-direction:column; min-width:0; min-height:0; }
+    #kx-main { display:flex; flex-direction:column; min-width:0; min-height:0; overflow:hidden; }
     .kx-field { display:flex; align-items:center; gap:8px; padding:5px 10px; }
     .kx-field label { color:var(--muted); font-size:11px; width:58px; flex-shrink:0; }
     .kx-field select, .kx-field input { flex:1; min-width:0; }
     #kx-msg { padding:6px 10px; font-size:11px; color:var(--muted); min-height:30px; word-break:break-word; }
     #kx-warn { display:none; margin:6px 10px; padding:6px 8px; border-radius:4px; font-size:11px;
                color:var(--warn); border:1px solid var(--warn); background:rgba(240,165,0,.08); }
-    #kx-log { flex:1; min-height:120px; margin:0; padding:8px 10px; overflow:auto; background:#0a0e14;
+    #kx-plan-wrap { flex:3 1 0; min-height:200px; display:flex; background:#0a0e14; }
+    #kx-plan { flex:1; min-width:0; width:100%; height:100%; display:block; }
+    #kx-plan-info { padding:8px 10px; font-size:11px; line-height:1.7; }
+    #kx-plan-info b { color:var(--muted); font-weight:600; display:inline-block; width:92px; }
+    #kx-tabs { display:flex; gap:4px; padding:0 6px; }
+    .kx-tab { background:none; border:none; border-bottom:2px solid transparent; color:var(--muted); cursor:pointer;
+              font:inherit; letter-spacing:inherit; text-transform:inherit; padding:5px 8px; }
+    .kx-tab.active { color:var(--accent); border-bottom-color:var(--accent); }
+    #kx-live { flex:2 1 0; min-height:140px; display:flex; flex-direction:column; background:#0a0e14; }
+    #kx-pane-live { flex:1 1 0; min-height:0; display:flex; flex-direction:column; }
+    #kx-chips { display:flex; flex-wrap:wrap; gap:5px; padding:6px 10px; background:var(--panel);
+                border-top:1px solid var(--border); flex-shrink:0; }
+    .kx-chip { border:1px solid var(--border); border-radius:4px; padding:2px 8px; font-size:11px;
+               font-weight:600; white-space:nowrap; }
+    .kx-chip b { color:var(--muted); font-weight:600; margin-right:5px; }
+    .kx-chip.ok { color:var(--ok); border-color:var(--ok); }
+    .kx-chip.warn { color:var(--warn); border-color:var(--warn); }
+    .kx-chip.danger { color:var(--danger); border-color:var(--danger); }
+    #kx-live-grid { flex:1; min-height:0; display:flex; }
+    #kx-cam-wrap { aspect-ratio:16/9; background:#000; display:flex; }
+    #kx-cam { width:100%; height:100%; object-fit:contain; }
+    #kx-track-wrap { flex:1; min-width:0; display:flex; }
+    #kx-track { width:100%; height:100%; display:block; }
+    #kx-log { flex:1 1 0; min-height:50px; margin:0; padding:8px 10px; overflow:auto; background:#0a0e14;
               font:11px/1.45 monospace; color:#9aa4b8; white-space:pre-wrap; }
-    #kx-runs-wrap { flex:1; min-height:0; overflow:auto; border-top:1px solid var(--border); }
+    #kx-runs-wrap { flex:1 1 0; min-height:0; overflow:auto; border-top:1px solid var(--border); }
     #kx-runs { width:100%; border-collapse:collapse; font-size:11px; }
     #kx-runs th { position:sticky; top:0; background:var(--panel); color:var(--muted); font-weight:700;
                   text-align:left; padding:5px 8px; border-bottom:1px solid var(--border); }
@@ -240,13 +264,13 @@
     .cam-sig.ok  { color:var(--ok); }
     #cam1 { flex:1; width:100%; min-height:0; display:block; }
 
-    /* Hexacopter motors — top-right, same height as camera */
-    #hex-block {
+    /* Quadcopter motors — top-right, same height as camera */
+    #motor-block {
       grid-column:3; grid-row:1;
       border-left:1px solid var(--border);
       background:var(--panel); display:flex; flex-direction:column; overflow:hidden;
     }
-    #hex-diagram { flex:1; width:100%; min-height:0; display:block; }
+    #motor-diagram { flex:1; width:100%; min-height:0; display:block; }
 
     /* Nav Map — bottom row, spans centre + right */
     #map-wrap {
@@ -321,7 +345,8 @@
     }
     #view-image.active { display:grid !important; }
     #img-left { display:flex; flex-direction:column; min-width:0; overflow:hidden; }
-    #img-cams { display:grid; grid-template-columns:1fr; flex:1; min-height:0; }
+    #img-cams { display:grid; grid-template-columns:1fr 1fr; grid-template-rows:1fr 1fr; flex:1; min-height:0; }
+    .img-key { font-weight:400; letter-spacing:0; text-transform:none; margin-left:6px; opacity:.8; }
     .img-cam { display:flex; flex-direction:column; background:#0d0f13;
                border-right:1px solid var(--border); overflow:hidden; }
     .img-cam:last-child { border-right:none; }
@@ -409,6 +434,80 @@
     .clfail { color:var(--danger); }
     .clsent { color:var(--accent); }
     .clwarn { color:var(--warn); }
+
+    /* ════════════════════════════════════════════
+       PHONE / NARROW SCREENS — one scrolling column
+       (canvases are sized from their parent, so each gets an explicit height)
+    ═══════════════════════════════════════════ */
+    button, select, input { touch-action:manipulation; }          /* no double-tap zoom: ARM / Start need a double tap */
+    @media (max-width: 900px) {
+      html, body { height:auto; min-height:100%; overflow:auto; -webkit-text-size-adjust:100%; }
+      body { padding-bottom:env(safe-area-inset-bottom); }
+      :root { --topbar: auto; }
+
+      #topbar { height:auto; flex-wrap:wrap; row-gap:2px; padding:6px 10px 0; position:sticky; top:0;
+                padding-top:calc(6px + env(safe-area-inset-top)); }
+      .logo { order:1; margin-right:auto; }
+      #conn-row { order:2; margin-left:0; gap:5px; }
+      #ros-url { max-width:84px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-right:2px; }
+      #hdr-gps { display:none; }
+      #tab-nav { order:3; flex:0 0 100%; height:40px; overflow-x:auto; -webkit-overflow-scrolling:touch; scrollbar-width:none; }
+      #tab-nav::-webkit-scrollbar { display:none; }
+      .tab-btn { padding:0 14px; flex-shrink:0; }
+      #conn-popover { top:100%; left:8px; right:8px; min-width:0; }
+
+      /* every view: a plain column, height from content */
+      .view, #view-dashboard, #view-navigation, #view-slam, #view-image, #view-kinetix { height:auto !important; }
+      #view-navigation.active, #view-slam.active, #view-image.active, #view-kinetix.active
+        { display:flex !important; flex-direction:column; }
+
+      /* dashboard: status + commands, camera, map, motors */
+      #dash-main { display:flex; flex-direction:column; height:auto; overflow:visible; }
+      #kpi-col { grid-column:auto; grid-row:auto; overflow:visible; border-right:none; border-bottom:1px solid var(--border); }
+      #cam-col  { height:62vw; min-height:210px; }
+      #map-wrap { height:min(110vw, 460px); border-top:1px solid var(--border); }
+      #motor-block { height:240px; border-left:none; border-top:1px solid var(--border); }
+      #cmd-log { max-height:90px; }
+      .cmd-btn, .cmd-btn-sm { min-height:42px; }
+      .svc-btn { padding:7px 14px; font-size:11px; }
+
+      /* navigation */
+      #nav-top { display:flex; flex-direction:column; border-bottom:none; }
+      #nav-top > .nav-card { height:260px; border-right:none; border-bottom:1px solid var(--border); }
+      #nav-top > .nav-card:last-child { height:auto; }
+      #nav-charts { display:flex; flex-direction:column; }
+      .chart-card { height:170px; border-right:none; border-bottom:1px solid var(--border); }
+
+      /* slam */
+      #slam-main { height:62vh; min-height:300px; }
+      #slam-side { border-left:none; border-top:1px solid var(--border); overflow:visible; }
+
+      /* image processing */
+      #img-left { overflow:visible; }
+      #img-cams { display:flex; flex-direction:column; }
+      .img-cam { height:58vw; min-height:200px; border-right:none; border-bottom:1px solid var(--border); }
+      #img-bottom { display:flex; flex-direction:column; height:auto; }
+      #detect-wrap { height:210px; border-right:none; border-bottom:1px solid var(--border); }
+      #dblog-wrap  { height:210px; }
+      #img-side { border-left:none; border-top:1px solid var(--border); overflow:visible; }
+
+      /* kinetix */
+      #kx-side { border-right:none; border-bottom:1px solid var(--border); overflow:visible; }
+      #kx-main { min-height:0; }
+      #kx-plan-wrap { flex:none; flex-direction:column; }
+      #kx-plan { height:min(100vw, 380px); }
+      #kx-pane-live { flex:none; }
+      #kx-live { flex:none; }
+      #kx-live-grid { flex-direction:column; }
+      #kx-track-wrap { flex:none; height:210px; }
+      #kx-log { flex:none; height:200px; min-height:0; }
+      #kx-runs-wrap { flex:none; height:200px; overflow:auto; }
+      #kx-runs th, #kx-runs td { padding:5px 7px; }
+
+      /* >=16px inputs: iOS Safari zooms the page when a smaller field is focused */
+      input, select, .cmd-input, #ros-input { font-size:16px; }
+      #tkoff-alt { width:64px !important; }
+    }
   </style>
 </head>
 <body>
@@ -417,11 +516,11 @@
 <header id="topbar">
   <span class="logo">DRONE <em>GCS</em></span>
   <nav id="tab-nav">
+    <button class="tab-btn"        data-view="kinetix">Kinetix</button>
     <button class="tab-btn active" data-view="dashboard">Dashboard</button>
     <button class="tab-btn"        data-view="navigation">Navigation</button>
     <button class="tab-btn"        data-view="slam">SLAM</button>
     <button class="tab-btn"        data-view="image">Image Processing</button>
-    <button class="tab-btn"        data-view="kinetix">Kinetix</button>
   </nav>
   <!-- Connection popover (toggled by clicking the URL) -->
   <div id="conn-popover">
@@ -432,7 +531,7 @@
     </div>
     <div class="pop-hint">Click URL to re-open · Enter to confirm</div>
     <hr id="pop-divider">
-    <button id="scan-btn">⬡ Scan network for Raspberry Pi</button>
+    <button id="scan-btn">⬡ Scan network for the companion computer</button>
     <div id="scan-status"></div>
     <div id="scan-results"></div>
   </div>
@@ -533,10 +632,10 @@
       <canvas id="cam1" style="flex:1;width:100%;min-height:0;display:block"></canvas>
     </div>
 
-    <!-- Hexacopter motor diagram (top-right — same height as camera) -->
-    <div id="hex-block">
+    <!-- Quadcopter (X) motor diagram (top-right — same height as camera) -->
+    <div id="motor-block">
       <div class="ph">Motors · Thrust %</div>
-      <canvas id="hex-diagram"></canvas>
+      <canvas id="motor-diagram"></canvas>
     </div>
 
     <!-- Nav Map (bottom — spans centre + right) -->
@@ -651,6 +750,7 @@
         <button id="btn-slam-start" class="cmd-btn ok"   style="flex:1">Map On</button>
         <button id="btn-slam-pause" class="cmd-btn warn" style="flex:1">Map Off</button>
       </div>
+      <button id="btn-slam-color" class="cmd-btn-sm" style="padding:6px 0">Colour: camera RGB</button>
       <button id="btn-slam-save"  class="cmd-btn accent">Save Map</button>
       <div style="display:flex;gap:5px">
         <button id="btn-slam-reset" class="cmd-btn-sm" style="flex:1;padding:5px 0">Reset Pose</button>
@@ -669,7 +769,28 @@
     <div id="img-cams">
       <div class="img-cam">
         <div class="ph" style="display:flex;justify-content:space-between">
-          <span>Cam 1 — Forward · Detecció de Codis</span>
+          <span>RGB — ZED left</span>
+          <span class="cam-sig no" id="icam-rgb-sig">NO SIGNAL</span>
+        </div>
+        <canvas id="icam-rgb"></canvas>
+      </div>
+      <div class="img-cam">
+        <div class="ph" style="display:flex;justify-content:space-between">
+          <span>Depth <span class="img-key">blue near · red far (0.3–10 m)</span></span>
+          <span class="cam-sig no" id="icam-depth-sig">NO SIGNAL</span>
+        </div>
+        <canvas id="icam-depth"></canvas>
+      </div>
+      <div class="img-cam">
+        <div class="ph" style="display:flex;justify-content:space-between">
+          <span>Confidence <span class="img-key">blue reliable · red unreliable</span></span>
+          <span class="cam-sig no" id="icam-conf-sig">NO SIGNAL</span>
+        </div>
+        <canvas id="icam-conf"></canvas>
+      </div>
+      <div class="img-cam">
+        <div class="ph" style="display:flex;justify-content:space-between">
+          <span>Barcode camera <span class="img-key">forward · detection overlay</span></span>
           <span class="cam-sig no" id="icam1-sig">NO SIGNAL</span>
         </div>
         <canvas id="icam1"></canvas>
@@ -678,12 +799,12 @@
     <div id="img-bottom">
       <div id="detect-wrap">
         <div class="ph" style="display:flex;justify-content:space-between;align-items:center">
-          <span>Inventari · Codis Detectats (<span id="db-count">0</span>)</span>
+          <span>Inventory · Detected Codes (<span id="db-count">0</span>)</span>
           <span id="db-last-code" class="bc-badge">—</span>
         </div>
         <div id="detect-scroll">
           <table id="detect-table">
-            <thead><tr><th>Hora</th><th>Codi</th><th>Producte</th><th>Posició</th></tr></thead>
+            <thead><tr><th>Time</th><th>Code</th><th>Product</th><th>Position</th></tr></thead>
             <tbody id="detect-tbody"></tbody>
           </table>
         </div>
@@ -698,14 +819,14 @@
   <!-- Right: volumetry sidebar -->
   <div id="img-side">
     <div class="ph" style="display:flex;justify-content:space-between;align-items:center">
-      <span>Detecció de Codis</span>
+      <span>Barcode Detection</span>
       <span class="svc-dot" id="svc-dot-barcode"></span>
     </div>
     <div style="padding:6px 8px;border-bottom:1px solid var(--border);flex-shrink:0">
       <button class="svc-btn" id="svc-btn-barcode" onclick="toggleService('barcode')"
         style="width:100%;padding:4px 0;font-size:11px">Start</button>
     </div>
-    <button class="db-export" onclick="exportBarcodeCSV()">⬇ Exportar CSV / Excel</button>
+    <button class="db-export" onclick="exportBarcodeCSV()">⬇ Export CSV / Excel</button>
     <div class="ph" style="margin-top:4px">Volumetry</div>
     <div class="vol-kpi">
       <div class="kpi-lbl">Last Volume</div>
@@ -726,7 +847,7 @@
 </section>
 
 <!-- ══════════════════════════════════════════════════════
-     KINETIX — whole-room photogrammetry (kinetix_bridge.py)
+     KINETIX — whole-room photogrammetry: plan + result (kinetix_bridge.py)
 ══════════════════════════════════════════════════════ -->
 <section class="view" id="view-kinetix">
   <div id="kx-side">
@@ -736,30 +857,54 @@
     <div class="srow"><span class="sk">Run</span>     <span class="sv" id="kx-run" style="font-size:10px;font-family:monospace">—</span></div>
     <div class="srow"><span class="sk">Elapsed</span> <span class="sv" id="kx-elapsed">—</span></div>
     <div id="kx-warn"></div>
+    <div class="ph">Chase view</div>
+    <div id="kx-cam-wrap"><canvas id="kx-cam" width="640" height="360"></canvas></div>
 
     <div class="ph" style="margin-top:4px">New capture</div>
     <div class="kx-field"><label>Scene</label>  <select id="kx-scene" class="cmd-input"></select></div>
     <div class="kx-field"><label>Method</label> <select id="kx-method" class="cmd-input"></select></div>
     <div class="kx-field"><label>Seed</label>   <input id="kx-seed" type="number" value="0" min="0" step="1" class="cmd-input"></div>
+    <div class="kx-field" title="Kinetix flies a short exploration with the ZED depth, fits the room's walls and obstacles, then plans the tour on that: no scene file needed. Tour method only.">
+      <label>Room</label>
+      <label style="width:auto;display:flex;align-items:center;gap:6px;color:var(--text);font-size:11px">
+        <input id="kx-explore" type="checkbox" style="flex:none;width:auto"> explore it first
+      </label>
+    </div>
     <div style="padding:7px 10px;display:flex;flex-direction:column;gap:5px">
       <button id="btn-kx-run"   class="cmd-btn ok">Start scan</button>
       <button id="btn-kx-abort" class="cmd-btn danger">Abort → return &amp; land</button>
-      <button id="btn-kx-sfm"   class="cmd-btn accent">Reconstruct latest run</button>
     </div>
     <div id="kx-msg"></div>
-    <div style="padding:4px 10px 10px;font-size:10px;color:var(--muted);line-height:1.5">
+    <!-- <div style="padding:4px 10px 10px;font-size:10px;color:var(--muted);line-height:1.5">
       tour ≈ 5 min, roi_coverage ≈ 25 min (sim wall time). Kinetix arms, takes off in OFFBOARD and lands by itself;
       it streams the setpoints, so don't use GOTO or the brain node meanwhile.
-    </div>
+    </div> -->
+    <div class="ph">Analysis</div>
+    <div id="kx-plan-info">No run yet.</div>
   </div>
   <div id="kx-main">
-    <div class="ph">Log</div>
-    <pre id="kx-log">Waiting for kinetix_bridge (/gcs/kinetix/status)…</pre>
-    <div class="ph">Recent runs</div>
-    <div id="kx-runs-wrap">
+    <div class="ph" id="kx-tabs">
+      <button class="kx-tab active" data-pane="kx-pane-live">Live</button><button class="kx-tab" data-pane="kx-log">Log</button><button class="kx-tab" data-pane="kx-runs-wrap">Runs</button>
+      <span id="kx-plan-run" style="font-family:monospace;text-transform:none;letter-spacing:0;margin-left:auto;align-self:center"></span>
+    </div>
+    <div id="kx-pane-live" class="kx-pane">
+      <div class="ph">Room plan 3D <span style="font-weight:400;letter-spacing:0;text-transform:none">· EKF vs ground truth</span></div>
+      <div id="kx-plan-wrap">
+        <canvas id="kx-plan"></canvas>
+      </div>
+      <div class="ph">EKF drift against ground truth <span style="font-weight:400;letter-spacing:0;text-transform:none">· % of distance flown</span></div>
+      <div id="kx-live">
+        <div id="kx-live-grid">
+          <div id="kx-track-wrap"><canvas id="kx-track"></canvas></div>
+        </div>
+      </div>
+      <div id="kx-chips"></div>
+    </div>
+    <pre id="kx-log" class="kx-pane" style="display:none">Waiting for kinetix_bridge (/gcs/kinetix/status)…</pre>
+    <div id="kx-runs-wrap" class="kx-pane" style="display:none">
       <table id="kx-runs">
         <thead><tr><th>Run</th><th>Method</th><th>Frames</th><th>Stop</th><th>Coverage</th>
-          <th>Registered</th><th>Points 3D</th><th>Reproj px</th><th>ATE m</th><th></th></tr></thead>
+          <th>Travel m</th><th>Wall s</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>

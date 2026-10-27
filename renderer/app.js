@@ -17,7 +17,7 @@ const S = {
   roll: 0, pitch: 0, yaw: 0,
   vx: 0, vy: 0, vz: 0,
   battery: { pct: 0, voltage: 0 },
-  motors: [0, 0, 0, 0, 0, 0],
+  motors: [0, 0, 0, 0],            // quadcopter X, PX4 order: M1 front-right, M2 rear-left, M3 front-left, M4 rear-right
   armed: false, mode: '—',
   gps: { lat: null, lon: null, altAbs: null, fix: 0, sats: 0 },
   trail: [],
@@ -38,7 +38,7 @@ const S = {
   missionName:  '—',
   missionDone:  false,
   coordOrigin:  null,   // {lat, lon, slamX, slamY} — GPS↔SLAM alignment snapshot
-  // pi services (controlled from dashboard)
+  // onboard services (controlled from dashboard)
   svcStatus: { mavros: 'stopped', brain: 'stopped', barcode: 'stopped' },
   kinetix: null, kinetixTs: 0,   // /gcs/kinetix/status (kinetix_bridge.py)
 }
@@ -53,12 +53,15 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.classList.add('active')
     $('view-' + btn.dataset.view).classList.add('active')
     S.activeView = btn.dataset.view
+    if (S.activeView === 'kinetix') kxLiveStart(); else kxLiveStop()
+    if (S.activeView === 'image') imgLiveStart(); else imgLiveStop()
+    zedViewRestart()
     resizeCanvases()
   })
 })
 
 // ── ROS connection ────────────────────────────────────────────────────────────
-// Served over http(s) (the web app): rosbridge on the same host. Electron (file://): the Pi default.
+// Served over http(s) (the web app): rosbridge on the same host. Electron (file://): the companion computer's default hostname.
 let ROS_URL = localStorage.getItem('ros_url') ||
   (location.protocol.startsWith('http') ? `ws://${location.hostname}:9090` : 'ws://raspi5.local:9090')
 let ros = null, reconnTimer = null
@@ -275,7 +278,7 @@ let _armPendingTs = 0
 // The UI speaks ArduCopter mode names; PX4 equivalents for a PX4 FCU
 const PX4_MODES = {
   STABILIZE: 'STABILIZED', GUIDED: 'OFFBOARD', LOITER: 'AUTO.LOITER',
-  AUTO: 'AUTO.MISSION', RTL: 'AUTO.RTL', LAND: 'AUTO.LAND',
+  AUTO: 'AUTO.MISSION', RTL: 'AUTO.RTL', LAND: 'AUTO.LAND', TAKEOFF: 'AUTO.TAKEOFF',
 }
 function fcuMode (mode) {
   return S.autopilot === 'px4' ? (PX4_MODES[mode] || mode) : mode
@@ -311,11 +314,21 @@ function cmdSetMode (mode) {
 }
 
 // ArduCopter: takeoff altitude is relative to home; lat/lon 0 = current position.
-// PX4 reads the altitude as AMSL, so a "5 m" request would be wrong — not sent.
+// PX4: MAV_CMD_NAV_TAKEOFF reads the altitude as AMSL, which a GPS-denied vehicle does not have, so a "5 m" request would be wrong.
+// PX4's Takeoff mode climbs a height above where it is, set by MIS_TAKEOFF_ALT: set that from the Alt field, then enter it.
+// The vehicle must be armed (tested on the sim: arm, AUTO.TAKEOFF climbs to the height and holds).
 function cmdTakeoff () {
-  const alt = parseFloat($('tkoff-alt').value) || 5
+  const alt = Math.min(50, Math.max(1, parseFloat($('tkoff-alt').value) || 5))
   if (S.autopilot === 'px4') {
-    addCmdLog('TAKEOFF (PX4 takes an AMSL altitude — not supported here)', 'FAIL')
+    if (!S.armed) { addCmdLog('TAKEOFF (arm first)', 'FAIL'); return }
+    addCmdLog('TAKEOFF ' + alt + 'm', 'SENT')
+    rosService(MAVROS_NS + '/param/set', 'mavros_msgs/ParamSetV2',
+      { param_id: 'MIS_TAKEOFF_ALT', value: { type: 3, double_value: alt } },       // 3 = double
+      r => {
+        if (r && r.success) cmdSetMode('TAKEOFF')
+        else addCmdLog('TAKEOFF (PX4 refused MIS_TAKEOFF_ALT)', 'FAIL')
+      },
+      err => addCmdLog('TAKEOFF height (' + err + ')', 'FAIL'))
     return
   }
   mavrosCall('TAKEOFF ' + alt + 'm', '/cmd/takeoff', 'mavros_msgs/CommandTOL',
@@ -362,6 +375,13 @@ function slamToggle (enable) {
 }
 
 // ZED odometry is fused by the flight controller's EKF: a reset while flying is a position jump
+function updateSlamColorBtn () {
+  const b = $('btn-slam-color')
+  if (!b) return
+  const rgb = SLAM3D.mode === 'rgb' && SLAM3D.hasRgb
+  b.textContent = rgb ? 'Colour: camera RGB' : (SLAM3D.mode === 'rgb' ? 'Colour: height (map has no RGB)' : 'Colour: height')
+}
+
 function slamResetPose () {
   if (S.armed) { addCmdLog('RESET POSE (disarm first — the EKF fuses ZED odometry)', 'FAIL'); return }
   zedCall('RESET POSE', '/reset_pos_tracking', 'std_srvs/Trigger', {})
@@ -372,9 +392,13 @@ function slamSaveMap () {
   const pts = SLAM3D.points()
   if (!pts.length) { addCmdLog('SAVE MAP (no map yet)', 'FAIL'); return }
   const n = pts.length / 3
+  const cols = SLAM3D.colors()                     // camera colour, when the map has it
   const lines = new Array(n)
-  for (let i = 0; i < n; i++) lines[i] = `${pts[3*i].toFixed(3)} ${pts[3*i+1].toFixed(3)} ${pts[3*i+2].toFixed(3)}`
-  const head = `# .PCD v0.7\nVERSION 0.7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\nWIDTH ${n}\nHEIGHT 1\nVIEWPOINT 0 0 0 1 0 0 0\nPOINTS ${n}\nDATA ascii\n`
+  for (let i = 0; i < n; i++) {
+    const xyz = `${pts[3*i].toFixed(3)} ${pts[3*i+1].toFixed(3)} ${pts[3*i+2].toFixed(3)}`
+    lines[i] = cols ? `${xyz} ${(Math.round(cols[3*i] * 255) << 16 | Math.round(cols[3*i+1] * 255) << 8 | Math.round(cols[3*i+2] * 255)) >>> 0}` : xyz
+  }
+  const head = `# .PCD v0.7\nVERSION 0.7\nFIELDS x y z${cols ? ' rgb' : ''}\nSIZE 4 4 4${cols ? ' 4' : ''}\nTYPE F F F${cols ? ' U' : ''}\nCOUNT 1 1 1${cols ? ' 1' : ''}\nWIDTH ${n}\nHEIGHT 1\nVIEWPOINT 0 0 0 1 0 0 0\nPOINTS ${n}\nDATA ascii\n`
   const name = 'zed_map_' + new Date().toISOString().replace(/[:.]/g, '-') + '.pcd'
   const a = document.createElement('a')
   a.href = URL.createObjectURL(new Blob([head + lines.join('\n') + '\n'], { type: 'text/plain' }))
@@ -397,9 +421,10 @@ function kxRun () {
   const t = Date.now()
   if (t - _kxRunPendingTs >= 800) { _kxRunPendingTs = t; $('kx-msg').textContent = 'click again to start the scan'; return }
   _kxRunPendingTs = 0
+  const explore = $('kx-explore').checked && $('kx-method').value === 'tour'
   kinetixCmd({ action: 'run', scene: $('kx-scene').value, method: $('kx-method').value,
-               seed: parseInt($('kx-seed').value, 10) || 0 })
-  addCmdLog('KINETIX SCAN ' + $('kx-method').value, 'SENT')
+               seed: parseInt($('kx-seed').value, 10) || 0, explore })
+  addCmdLog('KINETIX SCAN ' + $('kx-method').value + (explore ? ' (explore first)' : ''), 'SENT')
 }
 
 function kxAbort () {
@@ -407,9 +432,192 @@ function kxAbort () {
   addCmdLog('KINETIX ABORT', 'SENT')
 }
 
-function kxSfm (run) {
-  kinetixCmd(run ? { action: 'sfm', run } : { action: 'sfm' })
-  addCmdLog('KINETIX SFM ' + (run || 'latest'), 'SENT')
+function stopBrainNode () {
+  rosPub('/gcs/cmd', 'std_msgs/String', { data: JSON.stringify({ action: 'stop', service: 'brain' }) })
+  addCmdLog('STOP brain node (for Kinetix)', 'SENT')
+}
+
+// ── Kinetix live flight ───────────────────────────────────────────────────────
+// What the Lichtblick Kinetix layout showed, for flying a scan from the GCS: the ZED left image (what Kinetix captures),
+// FCU / battery / ZED-stack health, and how well the drone holds the setpoint Kinetix streams: distance, speed (= motion
+// blur), height and yaw error against Kinetix's own capture tolerances (published by the bridge as `tol`). Subscribed
+// only while the Kinetix tab is open, so the camera and pose streams cost nothing otherwise.
+const KXL = { subs: [], timer: null, pos: null, yaw: 0, sp: null, spYaw: 0, spTs: 0, vel: 0,
+              hist: [], t0: 0, trail: [], trailDist: 0, gtPos: null, gtTrail: [], gt0: null, ekf0: null, gtErr: null, wasArmed: false, tIn: null, zed: null, metrics: null }
+const KXL_HIST = 4000                                          // drift samples kept for the whole flight (5 Hz = 13 min); beyond it every 2nd is dropped
+const KXL_TOL  = { pos_m: 0.10, yaw_deg: 3.0, speed_mps: 0.05, settle_s: 1.0 }   // fallback = Kinetix default.yaml
+
+const quatYawDeg = q => Math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z)) * R2D
+const wrap180 = d => ((d + 540) % 360) - 180
+
+function kxLiveStart () {
+  if (KXL.subs.length || !ros || ros.isConnected === false) return
+  const ns = MAVROS_NS, drone = ns.replace(/\/mavros$/, '')
+  const fast = { throttle_rate: 100, queue_length: 1 }
+  KXL.subs = [
+    sub(ns + '/local_position/pose', 'geometry_msgs/PoseStamped', m => {
+      const p = m.pose.position
+      KXL.pos = [p.x, p.y, p.z]; KXL.yaw = quatYawDeg(m.pose.orientation)
+      const last = KXL.trail[KXL.trail.length - 1]
+      if (S.armed && (!last || Math.hypot(p.x - last[0], p.y - last[1], p.z - last[2]) > 0.05)) {
+        if (last) KXL.trailDist += Math.hypot(p.x - last[0], p.y - last[1], p.z - last[2])
+        KXL.trail.push([p.x, p.y, p.z]); if (KXL.trail.length > 1500) KXL.trail.shift()
+      }
+    }, fast),
+    // Pegasus ground truth (sim only; world frame): shifted onto the EKF map at the start of each flight
+    sub(drone + '/state/pose', 'geometry_msgs/PoseStamped', m => {
+      const p = m.pose.position
+      if (!KXL.pos) return
+      const gy = quatYawDeg(m.pose.orientation)
+      if (!KXL.gt0 || !KXL.ekf0) { KXL.gt0 = [p.x, p.y, p.z]; KXL.ekf0 = KXL.pos.slice(); KXL.gtYaw0 = gy; KXL.ekfYaw0 = KXL.yaw }
+      KXL.gtYaw = wrap180(gy - KXL.gtYaw0 + KXL.ekfYaw0)             // heading aligned like the position: both start equal at arming
+      const q = [p.x - KXL.gt0[0] + KXL.ekf0[0], p.y - KXL.gt0[1] + KXL.ekf0[1], p.z - KXL.gt0[2] + KXL.ekf0[2]]
+      KXL.gtPos = q; KXL.gtErr = Math.hypot(KXL.pos[0] - q[0], KXL.pos[1] - q[1], KXL.pos[2] - q[2])
+      const last = KXL.gtTrail[KXL.gtTrail.length - 1]
+      if (S.armed && (!last || Math.hypot(q[0] - last[0], q[1] - last[1], q[2] - last[2]) > 0.05)) {
+        KXL.gtTrail.push(q); if (KXL.gtTrail.length > 1500) KXL.gtTrail.shift()
+      }
+    }, fast),
+    sub(ns + '/setpoint_position/local', 'geometry_msgs/PoseStamped', m => {
+      const p = m.pose.position
+      KXL.sp = [p.x, p.y, p.z]; KXL.spYaw = quatYawDeg(m.pose.orientation); KXL.spTs = Date.now()
+    }, fast),
+    sub(ns + '/local_position/velocity_local', 'geometry_msgs/TwistStamped', m => {
+      const v = m.twist.linear; KXL.vel = Math.hypot(v.x ?? 0, v.y ?? 0, v.z ?? 0)
+    }, fast),
+    sub(drone + '/zed_stack/status', 'std_msgs/String', m => { try { KXL.zed = JSON.parse(m.data) } catch (_) {} },
+        { throttle_rate: 1000, queue_length: 1 }),
+    // chase view: zed_image_relay.py's JPEG of the sim's third-person camera (<drone ns>/gcs/chase/compressed)
+    subCamImage(MAP_TOPIC.replace(/\/gcs\/map_cloud$/, '') + '/gcs/chase/compressed', 'kx-cam', null, 0, null,
+                { throttle_rate: 100, queue_length: 1 }),
+  ]
+  KXL.timer = setInterval(kxLiveTick, 200)
+}
+
+function kxLiveStop () {
+  KXL.subs.forEach(t => { try { t && t.unsubscribe() } catch (_) {} })
+  KXL.subs = []
+  clearInterval(KXL.timer); KXL.timer = null
+}
+
+function kxLiveRestart () {                                    // namespace changed or reconnected: topics are new
+  kxLiveStop()
+  if (S.activeView === 'kinetix') kxLiveStart()
+}
+
+function kxLiveTick () {
+  const now = Date.now()
+  const tol = (S.kinetix && S.kinetix.tol && S.kinetix.tol.pos_m != null) ? S.kinetix.tol : KXL_TOL
+  if (S.armed && !KXL.wasArmed) { KXL.trail = []; KXL.gtTrail = []; KXL.trailDist = 0; KXL.gt0 = null; KXL.hist = []; KXL.t0 = now }          // a new flight starts a new trail
+  KXL.wasArmed = S.armed
+
+  let m = null
+  if (KXL.pos && KXL.sp && now - KXL.spTs < 1500) {            // Kinetix is streaming setpoints
+    const dx = KXL.pos[0] - KXL.sp[0], dy = KXL.pos[1] - KXL.sp[1], dz = KXL.pos[2] - KXL.sp[2]
+    m = { dist: Math.hypot(dx, dy, dz), dz, yaw: Math.abs(wrap180(KXL.yaw - KXL.spYaw)), speed: KXL.vel }
+    m.inTol = m.dist <= tol.pos_m && m.yaw <= tol.yaw_deg && m.speed <= tol.speed_mps
+    if (m.inTol) { if (KXL.tIn == null) KXL.tIn = now } else KXL.tIn = null
+    m.settled = KXL.tIn == null ? 0 : (now - KXL.tIn) / 1000
+  } else KXL.tIn = null
+  KXL.metrics = m
+  const e = KXL.pos && KXL.gtPos ? KXL.pos.map((v, i) => v - KXL.gtPos[i]) : null   // EKF - ground truth
+  const per = 100 / Math.max(KXL.trailDist, 1)                  // drift as % of the distance flown (1 m floor: no 1000 % right after takeoff)
+  if (e && S.armed) {                                           // the whole flight: from arming until disarm (the last flight stays on screen)
+    KXL.hist.push({ t: (now - KXL.t0) / 1000, err: Math.hypot(...e) * per, exy: Math.hypot(e[0], e[1]) * per, ez: e[2] * per })
+    if (KXL.hist.length > KXL_HIST) KXL.hist = KXL.hist.filter((_, i) => i % 2 === 0)
+  }
+
+  kxRenderChips(m, tol)
+  drawKxTrack(tol)
+  if (S.kinetix) drawKinetixPlan(S.kinetix, true)              // live position + setpoint on the plan map
+}
+
+function kxRenderChips (m, tol) {
+  const chip = (label, value, cls) => `<span class="kx-chip ${cls || ''}"><b>${label}</b>${value}</span>`
+  const link = S.mode !== '—'
+  const zed = KXL.zed
+  const zedBad = zed && zed.components ? Object.entries(zed.components).filter(([, c]) => c.state !== 'ok').map(([k]) => k) : []
+  const flight = S.flightStart ? Math.floor((Date.now() - S.flightStart) / 1000) : null
+  const html = [
+    chip('Mode', S.mode, S.mode === 'OFFBOARD' ? 'ok' : (link ? 'warn' : 'danger')),
+    chip('', S.armed ? 'ARMED' : 'DISARMED', S.armed ? 'warn' : ''),
+    chip('FCU', link ? 'connected' : 'no link', link ? 'ok' : 'danger'),
+    chip('ZED', !zed ? '—' : (zed.state === 'ok' ? 'ok' : (zedBad.join(', ') || zed.state)), !zed ? '' : (zed.state === 'ok' ? 'ok' : 'danger')),
+    m ? chip('Capture', m.inTol ? `in tolerance · ${Math.min(m.settled, tol.settle_s).toFixed(1)}/${tol.settle_s} s` : 'moving', m.inTol ? 'ok' : 'warn')
+      : chip('Capture', 'no setpoint', ''),
+    chip('Dist', m ? m.dist.toFixed(2) + ' m' : '—', m ? (m.dist <= tol.pos_m ? 'ok' : 'warn') : ''),
+    chip('Speed', m ? m.speed.toFixed(2) + ' m/s' : '—', m ? (m.speed <= tol.speed_mps ? 'ok' : 'warn') : ''),
+    chip('Height err', m ? (m.dz >= 0 ? '+' : '') + m.dz.toFixed(2) + ' m' : '—', ''),
+    chip('Yaw err', m ? m.yaw.toFixed(1) + '°' : '—', m ? (m.yaw <= tol.yaw_deg ? 'ok' : 'warn') : ''),
+    chip('GT err', KXL.gtErr == null ? '—' : KXL.gtErr.toFixed(2) + ' m' + (KXL.trailDist >= 1 ? ' · ' + (100 * KXL.gtErr / KXL.trailDist).toFixed(1) + '%' : ''), KXL.gtErr == null ? '' : (KXL.gtErr < 0.3 ? 'ok' : 'warn')),
+    chip('Flight', flight == null ? '—' : `${Math.floor(flight / 60)}:${String(flight % 60).padStart(2, '0')} · ${KXL.trailDist.toFixed(0)} m`, ''),
+  ].join('')
+  const el = $('kx-chips')
+  if (el && el.dataset.h !== html) { el.innerHTML = html; el.dataset.h = html }
+}
+
+// EKF error against ground truth over the last 30 s, in % of the distance flown: 3D, horizontal and vertical (signed)
+function drawKxTrack (tol) {
+  const cv = $('kx-track')
+  if (!cv) return
+  const dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight
+  if (!W || !H) return
+  if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr) }
+  const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0)
+  g.fillStyle = '#0a0e14'; g.fillRect(0, 0, W, H)
+  const series = [['3D err', 'err', '#f0883e'], ['horizontal', 'exy', '#3fb950'], ['vertical (z)', 'ez', '#d2a8ff']]
+  const pad = { t: 22, b: 18, l: 38, r: 10 }, gW = W - pad.l - pad.r, gH = H - pad.t - pad.b
+  const vals = KXL.hist.flatMap(h => [h.err, h.exy, h.ez]), tMax = Math.max(30, KXL.hist.length ? KXL.hist[KXL.hist.length - 1].t : 0)
+  const hi = Math.min(100, Math.max(2, ...vals.map(v => v * 1.1))), lo = Math.min(0, ...vals) * 1.1
+  const Y = v => pad.t + (1 - (v - lo) / (hi - lo)) * gH
+  g.font = '9px monospace'; g.textAlign = 'right'; g.lineWidth = 1
+  for (let i = 0; i <= 4; i++) {
+    const v = hi - (i / 4) * (hi - lo), y = Y(v)
+    g.strokeStyle = '#1e2530'; g.beginPath(); g.moveTo(pad.l, y); g.lineTo(W - pad.r, y); g.stroke()
+    g.fillStyle = '#4a5060'; g.fillText(v.toFixed(1) + '%', pad.l - 4, y + 3)
+  }
+  g.strokeStyle = '#4a5060'; g.beginPath(); g.moveTo(pad.l, Y(0)); g.lineTo(W - pad.r, Y(0)); g.stroke()   // zero = EKF on ground truth
+  series.forEach(([, key, color]) => {
+    g.strokeStyle = color; g.lineWidth = 1.6; g.beginPath(); let pen = false
+    KXL.hist.forEach(h => {
+      const x = pad.l + (h.t / tMax) * gW, y = Y(h[key])
+      pen ? g.lineTo(x, y) : g.moveTo(x, y); pen = true
+    })
+    g.stroke()
+  })
+  g.textAlign = 'left'; let lx = pad.l
+  const now = KXL.hist[KXL.hist.length - 1]
+  series.forEach(([label, key, color]) => { const t = '■ ' + label + (now ? ' ' + now[key].toFixed(1) + '%' : ''); g.fillStyle = color; g.fillText(t, lx, 12); lx += g.measureText(t).width + 12 })
+  g.fillStyle = '#4a5060'; g.textAlign = 'right'
+  g.fillText('whole flight · % of distance flown (GT aligned when armed)', W - pad.r, H - 5)
+  g.textAlign = 'left'; g.fillText(`0 s … ${Math.round(tMax)} s since arming`, pad.l, H - 5)
+}
+
+// ── Image tab: RGB, depth, confidence ─────────────────────────────────────────
+// RGB is the wrapper's own compressed left image; depth and confidence come from zed_image_relay.py (colour-mapped JPEGs, a
+// few per second: the raw 32-bit images are far too big for rosbridge). Subscribed only while the tab is open, and the relay
+// itself only reads the ZED topics while something here subscribes.
+let _imgSubs = []
+
+function imgLiveStart () {
+  if (_imgSubs.length || !ros || ros.isConnected === false) return
+  const relay = MAP_TOPIC.replace(/\/gcs\/map_cloud$/, '')       // the relays run in the drone namespace: <ns>/gcs/...
+  const slow = { throttle_rate: 200, queue_length: 1 }
+  _imgSubs = [
+    subCamImage(ZED_NS + '/left/color/rect/image/compressed', 'icam-rgb', 'icam-rgb-sig', 0, null, slow, true),
+    subCamImage(relay + '/gcs/depth/compressed', 'icam-depth', 'icam-depth-sig', 0, null, { queue_length: 1 }, true),
+    subCamImage(relay + '/gcs/confidence/compressed', 'icam-conf', 'icam-conf-sig', 0, null, { queue_length: 1 }, true),
+  ]
+}
+
+function imgLiveStop () {
+  _imgSubs.forEach(t => { try { t && t.unsubscribe() } catch (_) {} })
+  _imgSubs = []
+}
+
+function imgLiveRestart () {
+  imgLiveStop()
+  if (S.activeView === 'image') imgLiveStart()
 }
 
 function fillSelect (el, values) {
@@ -427,7 +635,7 @@ function updateKinetixUI () {
   $('kx-bridge').textContent = 'online'
   $('kx-bridge').className   = 'sv ok'
   $('kx-state').textContent  = k.state
-  $('kx-state').className    = 'sv ' + ({ flying: 'accent', reconstructing: 'accent', aborting: 'warn' }[k.state] || '')
+  $('kx-state').className    = 'sv ' + ({ flying: 'accent', aborting: 'warn' }[k.state] || '')
   $('kx-run').textContent    = (k.job && k.job.run) || '—'
   $('kx-elapsed').textContent = k.elapsed_s != null
     ? `${Math.floor(k.elapsed_s / 60)}:${String(k.elapsed_s % 60).padStart(2, '0')}` : '—'
@@ -443,29 +651,187 @@ function updateKinetixUI () {
 
   const warn = $('kx-warn')
   if (k.other_setpoint_producers > 0) {
+    const names = (k.setpoint_producers || []).join(', ')
     warn.style.display = 'block'
-    warn.textContent = `${k.other_setpoint_producers} other setpoint producer(s) on the drone ` +
-      '(another Kinetix run? the brain node?) — Start is refused until it stops.'
+    warn.textContent = `${k.other_setpoint_producers} other setpoint producer(s) on the drone` +
+      (names ? `: ${names}` : '') + ' — Start is refused until they stop.'
+    if (names.includes('brain_node')) {                       // the usual culprit: offer the fix right here
+      const b = document.createElement('button')
+      b.className = 'cmd-btn-sm'; b.textContent = 'Stop brain node'; b.style.marginTop = '6px'; b.style.display = 'block'
+      b.onclick = stopBrainNode
+      warn.appendChild(b)
+    }
   } else warn.style.display = 'none'
 
+  const tourOnly = $('kx-method').value !== 'tour'                  // exploring first is a tour feature
+  $('kx-explore').disabled = tourOnly || busy
+  if (tourOnly) $('kx-explore').checked = false
   $('btn-kx-run').disabled   = busy || k.other_setpoint_producers > 0
   $('btn-kx-abort').disabled = !busy || k.state === 'aborting'
-  $('btn-kx-sfm').disabled   = busy || !(k.runs || []).length
 
   const log = $('kx-log')
   const atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 4
   log.textContent = (k.log || []).join('\n') || '(no job output yet)'
   if (atEnd) log.scrollTop = log.scrollHeight
 
-  const f = (v, d) => v == null ? '—' : (typeof v === 'number' ? v.toFixed(d) : v)
-  $('kx-runs').querySelector('tbody').innerHTML = (k.runs || []).map(r => {
-    const m = r.sfm || {}
-    return `<tr><td class="id">${r.id}</td><td>${r.method || '—'}</td><td>${r.frames ?? '—'}</td>
+  const f = (v, d) => v == null ? '—' : v.toFixed(d)
+  $('kx-runs').querySelector('tbody').innerHTML = (k.runs || []).map(r =>
+    `<tr><td class="id">${r.id}</td><td>${r.method || '—'}</td><td>${r.frames ?? '—'}</td>
       <td>${r.stop || '—'}</td><td>${r.coverage != null ? (r.coverage * 100).toFixed(1) + '%' : '—'}</td>
-      <td>${m.registered != null ? m.registered + '/' + m.n_frames : '—'}</td><td>${m.points3D ?? '—'}</td>
-      <td>${f(m.reproj_px, 2)}</td><td>${f(m.ate_m, 3)}</td>
-      <td><button class="cmd-btn-sm" ${busy ? 'disabled' : ''} onclick="kxSfm('${r.id}')">Reconstruct</button></td></tr>`
-  }).join('')
+      <td>${f(r.travel_m, 1)}</td><td>${f(r.wall_s, 0)}</td></tr>`).join('')
+  drawKinetixPlan(k)
+}
+
+// 3D view (map x east, y north, z up) of the room box, the planned viewpoints, the path flown, and live the EKF pose and the
+// Pegasus ground truth. Without a plan yet it still draws the live trails.
+function drawKinetixPlan (k, skipInfo) {
+  const cv = $('kx-plan'), pl = k.plan
+  const info = $('kx-plan-info')
+  if (!pl && !skipInfo) { info.textContent = 'No run yet.'; $('kx-plan-run').textContent = '' }
+  if (!pl) return drawKinetixPlan({ ...k, plan: { views: [], path: [], no_fly: [] } }, true)
+  const run = (k.runs || []).find(r => r.id === pl.run) || {}
+  const pi = pl.info || {}
+  const pct = v => v == null ? '—' : (v * 100).toFixed(1) + '%'
+  const row = (a, b) => `<div><b>${a}</b>${b}</div>`
+  if (!skipInfo) {
+  $('kx-plan-run').textContent = ' · ' + pl.run
+  info.innerHTML =
+    row('Scene', pl.scene || '—') + row('Method', run.method || pi.plan || '—') +
+    (pi.explore ? row('Exploration', `${pi.explore.done ? 'done' : 'flying'} · ${pi.explore.views ?? '—'} views · faces seen ≥ ${pi.explore.faces_min != null ? Math.round(pi.explore.faces_min * 100) + '%' : '—'}`) : '') +
+    (pl.explored ? row('Room', 'fitted from depth' + (pl.no_fly && pl.no_fly.length ? ` · ${pl.no_fly.length} obstacle(s)` : '')) : '') +
+    row('Viewpoints', pl.views.length + (pi.viewpoints && pi.viewpoints !== pl.views.length ? ` / ${pi.viewpoints}` : '') +
+      ` · ${pl.views.filter(v => pl.path.some(p => Math.hypot(p[0] - v[0], p[1] - v[1], p[2] - v[2]) < 0.6)).length} reached`) +
+    row('Plan coverage', pct(pi.plan_coverage)) +
+    (pi.tour_m != null ? row('Planned tour', `${pi.tour_m} m · ~${Math.round(pi.est_flight_s)} s`) : '') +
+    '<div style="border-top:1px solid var(--border);margin:4px 0"></div>' +
+    row('Frames', run.frames ?? (pl.frames + ' (flying)')) + row('Coverage', pct(run.coverage)) +
+    row('Stop reason', run.stop || (k.state === 'idle' ? '—' : 'in progress')) +
+    row('Flown', run.travel_m != null ? run.travel_m + ' m' : '—') + row('Wall time', run.wall_s != null ? Math.round(run.wall_s) + ' s' : '—')
+  }
+
+  const dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight
+  if (!W || !H) return                                            // tab not visible
+  if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr) }
+  const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H)
+  const css = getComputedStyle(document.documentElement)
+  const col = n => css.getPropertyValue(n).trim() || '#888'
+
+  // 3D box [x0,y0,z0,x1,y1,z1] from a {center, size} entry (map frame, z up)
+  const box = b => b ? b.center.map((c, i) => c - b.size[i] / 2).concat(b.center.map((c, i) => c + b.size[i] / 2)) : null
+  // a planned viewpoint is "reached" (green) once a captured pose lies within 0.6 m of it (the path is sampled, ~1 m apart at most)
+  const reached = v => pl.path.some(p => Math.hypot(p[0] - v[0], p[1] - v[1], p[2] - v[2]) < 0.6)
+  const rb = box(pl.roi), wb = box(pl.workspace), nf = (pl.no_fly || []).map(box)
+  const live = S.activeView === 'kinetix'
+  const corners = b => [0, 1].flatMap(i => [0, 1].flatMap(j => [0, 1].map(k => [b[3 * i], b[1 + 3 * j], b[2 + 3 * k]])))
+  const fit = [...pl.views, ...(rb ? corners(rb) : []), ...(wb ? corners(wb) : []), ...nf.flatMap(corners)]
+  if (!fit.length) {                                              // no plan box: frame the drone (or the origin)
+    const c = KXL.pos || [0, 0, 1]; fit.push([c[0] - 5, c[1] - 5, 0], [c[0] + 5, c[1] + 5, 3])
+  }
+  const mid = [0, 1, 2].map(a => (Math.min(...fit.map(p => p[a])) + Math.max(...fit.map(p => p[a]))) / 2)
+  // orthographic orbit camera: az turns about z (0 = looking north), el tilts down; screen x = east-ish, up = z
+  const ca = Math.cos(PLAN3D.az), sa = Math.sin(PLAN3D.az), ce = Math.cos(PLAN3D.el), se = Math.sin(PLAN3D.el)
+  const proj = p => {
+    const dx = p[0] - mid[0], dy = p[1] - mid[1], dz = p[2] - mid[2]
+    const x1 = dx * ca + dy * sa, y1 = -dx * sa + dy * ca
+    return [x1, dz * ce + y1 * se]
+  }
+  const pr = fit.map(proj), pad = 24
+  const bw = Math.max(...pr.map(p => p[0])) - Math.min(...pr.map(p => p[0]))
+  const bh = Math.max(...pr.map(p => p[1])) - Math.min(...pr.map(p => p[1]))
+  const sc = PLAN3D.zoom * Math.min((W - 2 * pad) / Math.max(bw, 1e-6), (H - 2 * pad) / Math.max(bh, 1e-6))
+  const P = p => { const q = proj(p); return [W / 2 + q[0] * sc, H / 2 - q[1] * sc] }
+  const line = (pts, color, w, dash, alpha) => {
+    if (pts.length < 2) return
+    g.strokeStyle = color; g.lineWidth = w; g.setLineDash(dash || []); g.globalAlpha = alpha ?? 1; g.beginPath()
+    pts.forEach((p, i) => { const q = P(p); i ? g.lineTo(q[0], q[1]) : g.moveTo(q[0], q[1]) })
+    g.stroke(); g.setLineDash([]); g.globalAlpha = 1
+  }
+  const wire = (b, color, dash, w = 1) => {
+    if (!b) return
+    const [x0, y0, z0, x1, y1, z1] = b
+    ;[z0, z1].forEach(z => line([[x0, y0, z], [x1, y0, z], [x1, y1, z], [x0, y1, z], [x0, y0, z]], color, w, dash))
+    ;[[x0, y0], [x1, y0], [x1, y1], [x0, y1]].forEach(([x, y]) => line([[x, y, z0], [x, y, z1]], color, w, dash))
+  }
+  const dot = (p, r, color, ring) => {
+    const q = P(p); g.beginPath(); g.arc(q[0], q[1], r, 0, 6.283)
+    ring ? (g.strokeStyle = color, g.lineWidth = 2, g.stroke()) : (g.fillStyle = color, g.fill())
+  }
+
+  if (rb) {                                                        // floor grid (2 m) under the room box
+    for (let x = Math.ceil(rb[0] / 2) * 2; x <= rb[3]; x += 2) line([[x, rb[1], rb[2]], [x, rb[4], rb[2]]], col('--border'), 1, null, 0.5)
+    for (let y = Math.ceil(rb[1] / 2) * 2; y <= rb[4]; y += 2) line([[rb[0], y, rb[2]], [rb[3], y, rb[2]]], col('--border'), 1, null, 0.5)
+  }
+  wire(rb, col('--muted'), []); wire(wb, col('--muted'), [4, 4])
+  nf.forEach(b => wire(b, '#e04040', [], 1.5))                     // obstacles Kinetix knows about (fitted from depth, or the scene file's)
+
+  line(pl.views, col('--accent'), 1, [3, 3], 0.35)                 // planned order
+  line(pl.path, col('--ok'), 1, null, 0.5)                         // captured path
+  // camera snaps: faint magenta dot + the direction the camera looked, drawn under the viewpoints so they don't dominate; they read when zoomed in
+  g.globalAlpha = 0.3
+  pl.path.forEach(p => {
+    if (p.length >= 6) line([p, [p[0] + p[3], p[1] + p[4], p[2] + p[5]]], SNAP, 1, null, 0.3)
+    g.globalAlpha = 0.3                                            // line() resets it
+    dot(p, 1.5 + Math.min(PLAN3D.zoom, 4) * 0.6, SNAP)
+  })
+  g.globalAlpha = 1
+  // yaw arrow in the heading (map yaw, 0 = east, ccw), with a head; ~30 px long whatever the zoom
+  const arrow = (p, yawDeg, c, w) => {
+    const y = yawDeg / R2D, L = 30 / sc, tip = [p[0] + L * Math.cos(y), p[1] + L * Math.sin(y), p[2]]
+    line([p, tip], c, w)
+    ;[2.6, -2.6].forEach(d => line([tip, [tip[0] + 0.3 * L * Math.cos(y + d), tip[1] + 0.3 * L * Math.sin(y + d), tip[2]]], c, w))
+  }
+  g.fillStyle = col('--accent'); g.font = '9px monospace'; g.textAlign = 'left'
+  pl.views.forEach((v, i) => {
+    const c = reached(v) ? col('--ok') : col('--accent')
+    if (v[3] != null) arrow(v, v[3], c, 1.2)                       // planned heading (the h in the viewpoint label)
+    dot(v, 3.5, c)
+    if (pl.views.length <= 40) { const q = P(v); g.fillText(String(i + 1), q[0] + 5, q[1] - 4) }
+  })
+  if (live) {                                                      // live: EKF and ground truth, their trails, the setpoint Kinetix streams
+    line(KXL.gtTrail, PLAN3D.gt, 1.5, null, 0.7)
+    line(KXL.trail, PLAN3D.ekf, 1.5, null, 0.7)
+    if (KXL.sp && Date.now() - KXL.spTs < 1500) { dot(KXL.sp, 7, '#f0883e', true); arrow(KXL.sp, KXL.spYaw, '#f0883e', 1.5) }
+    ;[[KXL.gtPos, PLAN3D.gt, KXL.gtYaw], [KXL.pos, PLAN3D.ekf, KXL.yaw]].forEach(([p, c, yaw]) => {
+      if (!p) return
+      line([p, [p[0], p[1], rb ? rb[2] : 0]], c, 1, [2, 3], 0.5)   // drop line to the floor: reads the height
+      dot(p, 4, c)
+      if (yaw != null) arrow(p, yaw, c, 2)
+    })
+  }
+  // legend: each entry drawn in the colour it stands for, right-aligned bottom
+  const L = { plan: [`planned (blue)`, col('--accent')], reach: [`reached (green)`, col('--ok')], snap: [`camera snaps (magenta)`, SNAP],
+              ekf: [`EKF (white)`, PLAN3D.ekf], gt: [`ground truth (cyan)`, PLAN3D.gt], sp: [`setpoint (orange)`, '#f0883e'], hint: [`arrow = yaw · drag to rotate, wheel to zoom`, col('--muted')] }
+  const legend = W < 560 ? [[L.plan, L.reach, L.snap], [L.ekf, L.gt, L.hint]] : [[L.plan, L.reach, L.snap, L.ekf, L.gt, L.sp, L.hint]]
+  g.font = '9px monospace'; g.textAlign = 'left'
+  legend.forEach((row, i) => {
+    const sep = ' · '
+    let x = W - 8 - row.reduce((w, [t]) => w + g.measureText(t).width, 0) - g.measureText(sep).width * (row.length - 1)
+    const y = H - 8 - (legend.length - 1 - i) * 11
+    row.forEach(([t, c], j) => {
+      if (j) { g.fillStyle = col('--muted'); g.fillText(sep, x, y); x += g.measureText(sep).width }
+      g.fillStyle = c; g.fillText(t, x, y); x += g.measureText(t).width
+    })
+  })
+}
+
+// 3D plan view orbit: drag = rotate, wheel / pinch = zoom (redraws from the last status)
+const SNAP = '#e879f9'
+const PLAN3D = { az: 0.35, el: 0.6, zoom: 1, ekf: '#e6edf3', gt: '#39d0d8' }
+function initPlan3D () {
+  const cv = $('kx-plan'); let d = null
+  const redraw = () => { if (S.kinetix) drawKinetixPlan(S.kinetix, true) }
+  const move = (x, y) => {
+    PLAN3D.az -= (x - d.x) * 0.008; PLAN3D.el = Math.max(0.05, Math.min(1.5, PLAN3D.el + (y - d.y) * 0.008))
+    d.x = x; d.y = y; redraw()
+  }
+  cv.style.touchAction = 'none'
+  cv.addEventListener('pointerdown', e => { d = { x: e.clientX, y: e.clientY }; cv.setPointerCapture(e.pointerId) })
+  cv.addEventListener('pointermove', e => { if (d) move(e.clientX, e.clientY) })
+  cv.addEventListener('pointerup', () => { d = null })
+  cv.addEventListener('wheel', e => {
+    PLAN3D.zoom = Math.max(0.3, Math.min(6, PLAN3D.zoom * (1 - e.deltaY * 0.001))); redraw(); e.preventDefault()
+  }, { passive: false })
+  cv.addEventListener('dblclick', () => { Object.assign(PLAN3D, { az: 0.35, el: 0.6, zoom: 1 }); redraw() })
 }
 
 // ── init controls ─────────────────────────────────────────────────────────────
@@ -484,9 +850,13 @@ function initControls () {
     })
   })
 
+  initPlan3D()
+  document.querySelectorAll('.kx-tab').forEach(b => b.addEventListener('click', () => {
+    document.querySelectorAll('.kx-tab').forEach(t => t.classList.toggle('active', t === b))
+    document.querySelectorAll('.kx-pane').forEach(p => { p.style.display = p.id === b.dataset.pane ? '' : 'none' })
+  }))
   $('btn-kx-run').addEventListener('click', kxRun)
   $('btn-kx-abort').addEventListener('click', kxAbort)
-  $('btn-kx-sfm').addEventListener('click', () => kxSfm())
 
   $('btn-goto').addEventListener('click', cmdGoto)
   $('btn-vel-stop').addEventListener('click', cmdVelStop)
@@ -495,9 +865,13 @@ function initControls () {
   $('btn-slam-start').addEventListener('click', () => slamToggle(true))
   $('btn-slam-pause').addEventListener('click', () => slamToggle(false))
   $('btn-slam-save').addEventListener('click', slamSaveMap)
+  $('btn-slam-color').addEventListener('click', () => {
+    SLAM3D.setColorMode(SLAM3D.mode === 'rgb' ? 'height' : 'rgb')
+    updateSlamColorBtn()
+  })
   $('btn-slam-reset').addEventListener('click', slamResetPose)
   $('btn-slam-clear').addEventListener('click', () => {
-    SLAM3D.clearMap()
+    SLAM3D.clearMap(); SLAM3D.refit()
     $('sl-pts').textContent = '0'
     addCmdLog('Map cleared', 'ok')
   })
@@ -611,7 +985,7 @@ function subscribeMavros () {
     // motor throttle  (SERVO_OUTPUT_RAW → rc/out, PWM µs)
     sub(ns + '/rc/out', 'mavros_msgs/RCOut', m => {
       const ch = m.channels || []
-      for (let i = 0; i < 6; i++) {
+      for (let i = 0; i < 4; i++) {
         const pwm = ch[i] ?? 1000
         S.motors[i] = clamp((pwm - 1000) / 1000 * 100, 0, 100)
       }
@@ -658,6 +1032,8 @@ function subscribeMavros () {
       }
     }),
   ]
+  kxLiveRestart()                                  // Kinetix tab: same topics under the new namespace
+  imgLiveRestart()
 }
 
 // ── ZED: camera, VIO pose, spatial map ────────────────────────────────────────
@@ -666,13 +1042,30 @@ let ZED_NS    = '/zed/zed_node'
 let MAP_TOPIC = '/gcs/map_cloud'
 let _zedSubs  = []
 
+// The two heavy ZED streams (left image ≈ 1 MB/s, map cloud 0.6 MB/s) are subscribed only while their tab is open: rosbridge
+// drops messages ("Write queue full") when a slow client (Tailscale) can't keep up, and that made the Kinetix bridge flicker offline.
+let _zedViewSubs = []
+function zedViewRestart () {
+  _zedViewSubs.forEach(t => { try { t.unsubscribe() } catch (_) {} })
+  _zedViewSubs = []
+  if (!ros || ros.isConnected === false) return
+  if (S.activeView === 'dashboard') _zedViewSubs.push(          // cam1: ZED left image, JPEG, ≤ 10 fps
+    subCamImage(ZED_NS + '/left/color/rect/image/compressed', 'cam1', 'cam1-sig', 0, null, { throttle_rate: 100, queue_length: 1 }))
+  if (S.activeView === 'slam') _zedViewSubs.push(               // spatial map: each message is the whole map, so it replaces the view
+    sub(MAP_TOPIC, 'sensor_msgs/PointCloud2', m => {
+      SLAM3D.clearMap()
+      SLAM3D.addScan(decodePC2xyz(m))
+      updateSlamColorBtn()
+      $('sl-pts').textContent    = SLAM3D.count.toLocaleString()
+      $('sl-minr').textContent   = m.header.frame_id || '—'
+      $('sl-status').textContent = 'Mapping'
+      $('sl-status').className   = 'sv ok'
+    }, { queue_length: 1 }))
+}
+
 function subscribeZed () {
   _zedSubs.forEach(t => t.unsubscribe())
   _zedSubs = [
-    // cam1 — dashboard: ZED left image, JPEG, ≤ 10 fps through rosbridge
-    subCamImage(ZED_NS + '/left/color/rect/image/compressed', 'cam1', 'cam1-sig', 0, null,
-      { throttle_rate: 100, queue_length: 1 }),
-
     // VIO pose (frame odom = map at start, child zed_camera_link)
     sub(ZED_NS + '/odom', 'nav_msgs/Odometry', m => {
       const p = m.pose.pose
@@ -684,17 +1077,10 @@ function subscribeZed () {
       updateSlamPoseUI()
       pushSlamTrail()
     }, { throttle_rate: 100, queue_length: 1 }),
-
-    // Spatial map — each message is the whole map, so it replaces the view
-    sub(MAP_TOPIC, 'sensor_msgs/PointCloud2', m => {
-      SLAM3D.clearMap()
-      SLAM3D.addScan(decodePC2xyz(m))
-      $('sl-pts').textContent    = SLAM3D.count.toLocaleString()
-      $('sl-minr').textContent   = m.header.frame_id || '—'
-      $('sl-status').textContent = 'Mapping'
-      $('sl-status').className   = 'sv ok'
-    }, { queue_length: 1 }),
   ]
+  zedViewRestart()
+  kxLiveRestart()                                  // Kinetix tab: same topics under the new namespace
+  imgLiveRestart()
 }
 
 function subscribe () {
@@ -705,6 +1091,10 @@ function subscribe () {
   subscribeMavros()
   _zedSubs = []
   subscribeZed()
+  KXL.subs = []                                     // belonged to the closed connection
+  _imgSubs = []
+  kxLiveRestart()
+  imgLiveRestart()
   detectNamespaces()
 
   // GCS control node — service status
@@ -713,7 +1103,7 @@ function subscribe () {
     updateSvcUI()
   })
 
-  // Kinetix bridge — capture / reconstruction jobs
+  // Kinetix bridge — capture jobs, plan and result
   sub('/gcs/kinetix/status', 'std_msgs/String', m => {
     try { S.kinetix = JSON.parse(m.data); S.kinetixTs = Date.now() } catch (_) { return }
     updateKinetixUI()
@@ -786,7 +1176,9 @@ function subscribe () {
 // Subscribe to a compressed image topic and draw to a canvas by id
 // rotation: 0 | 90 | 180 | 270 (degrees clockwise)
 // swap: null | [a, b] — swap pixel channels a and b (0=R,1=G,2=B) e.g. [0,1] fixes R↔G
-function subCamImage (topic, canvasId, sigId, rotation = 0, swap = null, opts = {}) {
+const CAM_TS = {}                         // sigId -> last frame time: a feed silent for 3 s shows NO SIGNAL
+
+function subCamImage (topic, canvasId, sigId, rotation = 0, swap = null, opts = {}, fit = false) {
   if (!canvasId) return
   return sub(topic, 'sensor_msgs/CompressedImage', m => {
     const canvas = $(canvasId)
@@ -808,6 +1200,11 @@ function subCamImage (topic, canvasId, sigId, rotation = 0, swap = null, opts = 
         } else if (rotation === 270) {
           ctx.translate(0, H); ctx.rotate(-Math.PI / 2)
           ctx.drawImage(bitmap, 0, 0, H, W)
+        } else if (fit) {                                 // keep the picture's aspect ratio (depth / confidence panels)
+          const k = Math.min(W / bitmap.width, H / bitmap.height)
+          const w = bitmap.width * k, h = bitmap.height * k
+          ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H)
+          ctx.drawImage(bitmap, (W - w) / 2, (H - h) / 2, w, h)
         } else {
           ctx.drawImage(bitmap, 0, 0, W, H)
         }
@@ -821,7 +1218,7 @@ function subCamImage (topic, canvasId, sigId, rotation = 0, swap = null, opts = 
           ctx.putImageData(id, 0, 0)
         }
         bitmap.close()
-        if (sigId) { const s = $(sigId); if (s) { s.textContent = 'LIVE'; s.className = 'cam-sig ok' } }
+        if (sigId) { CAM_TS[sigId] = Date.now(); const s = $(sigId); if (s) { s.textContent = 'LIVE'; s.className = 'cam-sig ok' } }
       }).catch(() => {})
     } catch (_) {}
   }, opts)
@@ -865,11 +1262,16 @@ function toggleService (svc) {
 
 // ── DOM updates (text/badges) ─────────────────────────────────────────────────
 function updateDOM () {
-  // Kinetix bridge silent for 3 s (status is 1 Hz): offline, nothing to press
-  if (Date.now() - S.kinetixTs > 3000) {
+  for (const id in CAM_TS) {                                   // feeds that stopped
+    if (Date.now() - CAM_TS[id] > 3000) {
+      const s = $(id); if (s && s.textContent !== 'NO SIGNAL') { s.textContent = 'NO SIGNAL'; s.className = 'cam-sig no' }
+    }
+  }
+  // Kinetix bridge silent for 8 s (status is 1 Hz; a slow link may drop a few): offline, nothing to press
+  if (Date.now() - S.kinetixTs > 8000) {
     $('kx-bridge').textContent = 'offline'
     $('kx-bridge').className   = 'sv danger'
-    ;['btn-kx-run', 'btn-kx-abort', 'btn-kx-sfm'].forEach(id => { $(id).disabled = true })
+    ;['btn-kx-run', 'btn-kx-abort'].forEach(id => { $(id).disabled = true })
   }
   // header badges
   const armEl = $('hdr-armed')
@@ -992,7 +1394,7 @@ function updateDetectTable () {
 }
 
 function exportBarcodeCSV () {
-  const rows = [['Hora', 'Codi', 'Producte', 'Posicio X (m)', 'Posicio Y (m)', 'Estat']]
+  const rows = [['Time', 'Code', 'Product', 'Position X (m)', 'Position Y (m)', 'Status']]
   S.barcodes.forEach(r => {
     rows.push([
       r.time,
@@ -1154,27 +1556,28 @@ function drawMotor (id, pct) {
   ctx.fillText(Math.round(pct)+'%', cx, cy)
 }
 
-function drawHexDiagram () {
-  const canvas = $('hex-diagram')
+function drawMotorDiagram () {
+  const canvas = $('motor-diagram')
   if (!canvas) return
   const W = canvas.width, H = canvas.height, ctx = canvas.getContext('2d')
   ctx.clearRect(0, 0, W, H)
 
   const cx = W / 2, cy = H / 2
   const sz  = Math.min(W, H)
-  const reach = sz * 0.36          // centre → motor knob centre (px)
+  const reach = sz * 0.42          // centre → motor knob centre (px)
   const scale = reach / 0.5        // normalised unit → px
-  const mR  = sz * 0.092           // knob outer radius
+  const mR  = sz * 0.14            // knob outer radius: big enough to read the needle from across the room
+  const SHOW_VALUES = false        // thrust is the arc + needle; true adds the numeric % in each knob
   // Rotary knob sweep: 270° starting at 7:30 (canvas 225°) going clockwise
   const SA = 225 * DEG, TA = 270 * DEG
 
+  // Quadcopter X, nose up, PX4 motor order and spin: M1 front-right CCW, M2 rear-left CCW, M3 front-left CW, M4 rear-right CW
+  // (matches the raptor: bisg_isaac's motors_body_xy). Arms are as long as the old hex layout's: 0.5 · (±cos45°, ±sin45°)
   const MOTORS = [
-    { n:1, sx: 0.50, sy: 0.00, ccw:false },
-    { n:2, sx:-0.50, sy: 0.00, ccw:true  },
-    { n:3, sx:-0.25, sy:-0.43, ccw:false },
-    { n:4, sx: 0.25, sy: 0.43, ccw:true  },
-    { n:5, sx: 0.25, sy:-0.43, ccw:true  },
-    { n:6, sx:-0.25, sy: 0.43, ccw:false },
+    { n:1, sx: 0.354, sy:-0.354, ccw:true  },
+    { n:2, sx:-0.354, sy: 0.354, ccw:true  },
+    { n:3, sx:-0.354, sy:-0.354, ccw:false },
+    { n:4, sx: 0.354, sy: 0.354, ccw:false },
   ]
 
   // ── 1. Arms ────────────────────────────────────────────────────────────
@@ -1233,14 +1636,16 @@ function drawHexDiagram () {
     ctx.strokeStyle = activeCol + '55'; ctx.lineWidth = 1.5; ctx.lineCap = 'butt'; ctx.stroke()
 
     // ── Labels ───────────────────────────────────────
-    const fs = Math.max(8, Math.round(mR * 0.38))
+    const fs = Math.max(9, Math.round(mR * 0.34))
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
-    ctx.fillStyle = '#5a6072'
+    ctx.fillStyle = '#8a93a8'
     ctx.font = `bold ${fs}px monospace`
-    ctx.fillText('M' + m.n, mx, my - mR * 0.22)
-    ctx.fillStyle = pct > 0 ? thrCol : '#3a4050'
-    ctx.font = `bold ${Math.max(7, Math.round(mR * 0.34))}px monospace`
-    ctx.fillText(Math.round(pct) + '%', mx, my + mR * 0.26)
+    ctx.fillText('M' + m.n, mx, SHOW_VALUES ? my - mR * 0.22 : my + mR * 0.34)       // label sits below the needle's pivot
+    if (SHOW_VALUES) {
+      ctx.fillStyle = pct > 0 ? thrCol : '#3a4050'
+      ctx.font = `bold ${Math.max(7, Math.round(mR * 0.34))}px monospace`
+      ctx.fillText(Math.round(pct) + '%', mx, my + mR * 0.26)
+    }
   })
 
   // ── 3. Central body hub ────────────────────────────────────────────────
@@ -1616,17 +2021,19 @@ function decodePC2xyz (msg) {
   const raw = atob(msg.data)
   const buf = new Uint8Array(raw.length)
   for (let i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i)
-  let xOff = 0, yOff = 4, zOff = 8
+  let xOff = 0, yOff = 4, zOff = 8, cOff = -1
   if (msg.fields) msg.fields.forEach(f => {
     if (f.name === 'x') xOff = f.offset
     if (f.name === 'y') yOff = f.offset
     if (f.name === 'z') zOff = f.offset
+    if (f.name === 'rgb' || f.name === 'rgba') cOff = f.offset
   })
   const step = msg.point_step || 26
   const count = (msg.width || 0) * (msg.height || 1)
   const le = !msg.is_bigendian
   const dv = new DataView(buf.buffer)
   const out = new Float32Array(count * 3)
+  const col = cOff >= 0 ? new Float32Array(count * 3) : null     // 0..1 per channel
   let n = 0
   for (let i = 0; i < count; i++) {
     const b = i * step
@@ -1635,10 +2042,14 @@ function decodePC2xyz (msg) {
     const y = dv.getFloat32(b + yOff, le)
     const z = dv.getFloat32(b + zOff, le)
     if (isFinite(x) && isFinite(y) && isFinite(z)) {
+      if (col) {                                   // packed colour: R bits 16-23, G 8-15, B 0-7 (bytes B,G,R,A in memory)
+        const c = dv.getUint32(b + cOff, le)
+        col[n] = ((c >> 16) & 255) / 255; col[n + 1] = ((c >> 8) & 255) / 255; col[n + 2] = (c & 255) / 255
+      }
       out[n++] = x; out[n++] = y; out[n++] = z
     }
   }
-  return { data: out, count: n / 3 }
+  return { data: out, rgb: col, count: n / 3 }
 }
 
 // ── SLAM 3D WebGL point-cloud renderer (ZED spatial map) ─────────────────────
@@ -1647,8 +2058,11 @@ const SLAM3D = (() => {
   let gl = null, prog = null, bufPos = null, bufCol = null
   let uMVP = -1, uSz = -1, aPos = -1, aCol = -1
   const posArr = new Float32Array(MAX * 3)
-  const colArr = new Float32Array(MAX * 3)
+  const colArr = new Float32Array(MAX * 3)      // what is drawn
+  const rgbArr = new Float32Array(MAX * 3)      // the camera colour from the ZED map (when it has one)
   let total = 0, ready = false
+  let fitPending = true                         // frame the whole map on the first scan after a clear
+  let hasRgb = false, mode = 'rgb'              // 'rgb' = camera colour, 'height' = by z
 
   const cam = { theta: 0.4, phi: 0.42, dist: 12, tx: 0, ty: 0, tz: 0 }
   let drag = null
@@ -1667,8 +2081,8 @@ const SLAM3D = (() => {
   }
 
   // RViz2-style rainbow: blue(low) → cyan → green → yellow → red(high)
-  function hcol (z) {
-    const t = Math.max(0, Math.min(1, (z + 0.5) / 3.0))
+  function ramp (t) {                           // blue → cyan → green → yellow → red
+    t = Math.max(0, Math.min(1, t))
     if (t < 0.25) return [0,        t * 4,          1]
     if (t < 0.5)  return [0,        1,               1 - (t - 0.25) * 4]
     if (t < 0.75) return [(t-0.5)*4, 1,              0]
@@ -1759,29 +2173,90 @@ const SLAM3D = (() => {
       e.preventDefault()
     }, { passive: false })
     canvas.addEventListener('contextmenu', e => e.preventDefault())
+
+    // touch: one finger rotates, two fingers pinch-zoom and pan
+    let tp = null
+    const tinfo = ts => ts.length > 1
+      ? { n: 2, x: (ts[0].clientX + ts[1].clientX) / 2, y: (ts[0].clientY + ts[1].clientY) / 2,
+          d: Math.hypot(ts[0].clientX - ts[1].clientX, ts[0].clientY - ts[1].clientY) }
+      : { n: 1, x: ts[0].clientX, y: ts[0].clientY, d: 0 }
+    canvas.style.touchAction = 'none'
+    canvas.addEventListener('touchstart', e => { tp = tinfo(e.touches); e.preventDefault() }, { passive: false })
+    canvas.addEventListener('touchmove', e => {
+      if (!tp) return
+      const t = tinfo(e.touches)
+      if (t.n !== tp.n) { tp = t; return }
+      const dx = t.x - tp.x, dy = t.y - tp.y
+      if (t.n === 1) {
+        cam.theta -= dx * 0.006
+        cam.phi = Math.max(-1.4, Math.min(1.4, cam.phi - dy * 0.006))
+      } else {
+        cam.dist = Math.max(0.3, Math.min(300, cam.dist * (tp.d / Math.max(t.d, 1))))
+        const s = cam.dist * 0.0015
+        cam.tx -= dx * s * Math.cos(cam.theta)
+        cam.ty -= dx * s * Math.sin(cam.theta)
+        cam.tz += dy * s
+      }
+      tp = t; e.preventDefault()
+    }, { passive: false })
+    canvas.addEventListener('touchend', e => { tp = e.touches.length ? tinfo(e.touches) : null })
     ready = true; return true
   }
 
   function addScan (scan) {
     // Always accumulate into CPU arrays (even before WebGL is ready)
+    if (total === 0) hasRgb = !!scan.rgb
+    else if (!scan.rgb) hasRgb = false
     for (let i = 0; i < scan.count; i++) {
       const slot = (total % MAX) * 3
       const si   = i * 3
       posArr[slot]   = scan.data[si]
       posArr[slot+1] = scan.data[si+1]
       posArr[slot+2] = scan.data[si+2]
-      const [r,g,b]  = hcol(scan.data[si+2])
-      colArr[slot] = r; colArr[slot+1] = g; colArr[slot+2] = b
+      if (scan.rgb) { rgbArr[slot] = scan.rgb[si]; rgbArr[slot+1] = scan.rgb[si+1]; rgbArr[slot+2] = scan.rgb[si+2] }
       total++
+    }
+    recolor()
+    if (fitPending && scan.count > 0) { fitPending = false; fitView() }
+  }
+
+  function fitView () {                         // centre on the map's 2nd–98th percentile box (ignores stray far points)
+    const used = Math.min(total, MAX), k = Math.max(1, Math.floor(used / 4000)), c = [[], [], []]
+    for (let i = 0; i < used; i += k) for (let a = 0; a < 3; a++) c[a].push(posArr[i * 3 + a])
+    const q = a => { a.sort((x, y) => x - y); return [a[Math.floor(a.length * 0.02)], a[Math.min(a.length - 1, Math.floor(a.length * 0.98))]] }
+    const [x, y, z] = c.map(q)
+    cam.tx = (x[0] + x[1]) / 2; cam.ty = (y[0] + y[1]) / 2; cam.tz = (z[0] + z[1]) / 2
+    cam.dist = Math.max(3, Math.hypot(x[1] - x[0], y[1] - y[0], z[1] - z[0]) * 1.05)
+    cam.phi = 0.7
+  }
+
+  // Fill colArr for the current mode and upload. Height colours span the map's own 2nd–98th percentile of z, so a
+  // 9 m high room uses the whole ramp (the old fixed -0.5..2.5 m range turned everything above 2.5 m one colour).
+  function recolor () {
+    const used = Math.min(total, MAX)
+    if (mode === 'rgb' && hasRgb) {
+      colArr.set(rgbArr.subarray(0, used * 3))
+    } else if (used) {
+      const zs = []
+      const k = Math.max(1, Math.floor(used / 4000))
+      for (let i = 0; i < used; i += k) zs.push(posArr[i * 3 + 2])
+      zs.sort((a, b) => a - b)
+      const lo = zs[Math.floor(zs.length * 0.02)], hi = zs[Math.min(zs.length - 1, Math.floor(zs.length * 0.98))]
+      const span = Math.max(hi - lo, 0.5)
+      for (let i = 0; i < used; i++) {
+        const [r, g, b] = ramp((posArr[i * 3 + 2] - lo) / span)
+        colArr[i*3] = r; colArr[i*3+1] = g; colArr[i*3+2] = b
+      }
     }
     // Upload to GPU only if WebGL context exists
     if (!ready) return
-    const used = Math.min(total, MAX) * 3
     gl.bindBuffer(gl.ARRAY_BUFFER, bufPos)
-    gl.bufferSubData(gl.ARRAY_BUFFER, 0, posArr.subarray(0, used))
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, posArr.subarray(0, used * 3))
     gl.bindBuffer(gl.ARRAY_BUFFER, bufCol)
-    gl.bufferSubData(gl.ARRAY_BUFFER, 0, colArr.subarray(0, used))
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, colArr.subarray(0, used * 3))
   }
+
+  function setColorMode (m) { mode = m; recolor() }
 
   function render (canvas) {
     if (!ready) return
@@ -1792,7 +2267,7 @@ const SLAM3D = (() => {
     const used = Math.min(total, MAX)
     if (used === 0) return
     gl.uniformMatrix4fv(uMVP, false, mvpMat(W, H))
-    gl.uniform1f(uSz, Math.max(2, 60 / cam.dist))
+    gl.uniform1f(uSz, 0.15 * H)                    // px = 0.15·H / depth ≈ a 0.17 m voxel on screen: the map reads as a surface, not dust
     gl.bindBuffer(gl.ARRAY_BUFFER, bufPos)
     gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0)
     gl.bindBuffer(gl.ARRAY_BUFFER, bufCol)
@@ -1801,15 +2276,17 @@ const SLAM3D = (() => {
   }
 
   function clearMap () {
-    total = 0
-    posArr.fill(0); colArr.fill(0)
+    total = 0; hasRgb = false
+    posArr.fill(0); colArr.fill(0); rgbArr.fill(0)
     if (ready) {
       gl.bindBuffer(gl.ARRAY_BUFFER, bufPos); gl.bufferData(gl.ARRAY_BUFFER, posArr, gl.DYNAMIC_DRAW)
       gl.bindBuffer(gl.ARRAY_BUFFER, bufCol); gl.bufferData(gl.ARRAY_BUFFER, colArr, gl.DYNAMIC_DRAW)
     }
   }
 
-  return { init, addScan, render, clearMap, cam, points: () => posArr.subarray(0, Math.min(total, MAX) * 3),
+  return { init, addScan, render, clearMap, cam, setColorMode, refit: () => { fitPending = true }, points: () => posArr.subarray(0, Math.min(total, MAX) * 3),
+           colors: () => hasRgb ? rgbArr.subarray(0, Math.min(total, MAX) * 3) : null,
+           get hasRgb () { return hasRgb }, get mode () { return mode },
            get count () { return Math.min(total, MAX) } }
 })()
 
@@ -1869,8 +2346,8 @@ function drawTestPattern (canvasId, hue) {
 // ── canvas resize ─────────────────────────────────────────────────────────────
 function resizeCanvases () {
   const ro = new ResizeObserver(() => {
-    ;['cam1','icam1','icam2','horizon-canvas','compass-canvas',
-      'chart-alt','chart-spd','chart-vspd','hex-diagram'].forEach(id => {
+    ;['cam1','icam1','icam2','icam-rgb','icam-depth','icam-conf','horizon-canvas','compass-canvas',
+      'chart-alt','chart-spd','chart-vspd','motor-diagram'].forEach(id => {
       const c = $(id)
       if (!c || !c.parentElement) return
       c.width  = c.offsetWidth  || c.parentElement.clientWidth
@@ -1879,7 +2356,7 @@ function resizeCanvases () {
     drawMap()
     drawSLAM()
   })
-  ;['cam-col','hex-block','img-left','img-cams','nav-top','nav-charts','slam-main'].forEach(id => {
+  ;['cam-col','motor-block','img-left','img-cams','nav-top','nav-charts','slam-main'].forEach(id => {
     const el = $(id)
     if (el) ro.observe(el)
   })
@@ -1890,7 +2367,7 @@ function frame () {
   updateDOM()
   drawSpeedometer()
   drawBatteryArc()
-  drawHexDiagram()
+  drawMotorDiagram()
   drawMap()
 
   if (S.activeView === 'navigation') {
@@ -1912,7 +2389,14 @@ document.addEventListener('DOMContentLoaded', () => {
   drawTestPattern('cam1',  0)
   drawTestPattern('icam1', 0)
   drawTestPattern('icam2', 120)
+  drawTestPattern('icam-rgb', 0)
+  drawTestPattern('icam-depth', 60)
+  drawTestPattern('icam-conf', 120)
   resizeCanvases()
+  // ?tab=kinetix (dashboard | navigation | slam | image | kinetix) opens that tab: a phone bookmark per tab
+  const wanted = new URLSearchParams(location.search).get('tab')
+  const wantedBtn = document.querySelector(`.tab-btn[data-view="${wanted || 'kinetix'}"]`)   // Kinetix is the default tab
+  if (wantedBtn) wantedBtn.click()
   initConnPopover()
   initControls()
   connect()

@@ -10,7 +10,7 @@ function createWindow () {
     minWidth: 1280,
     minHeight: 740,
     backgroundColor: '#1a1d23',
-    title: 'Drone GCS',
+    title: 'mavros gcs',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
