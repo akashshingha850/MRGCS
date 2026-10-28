@@ -10,7 +10,7 @@ function createWindow () {
     minWidth: 1280,
     minHeight: 740,
     backgroundColor: '#1a1d23',
-    title: 'mavros gcs',
+    title: 'MRGCS',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,

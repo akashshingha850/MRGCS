@@ -1,4 +1,4 @@
-# mavros-gcs compose. Run from the repo root.
+# MRGCS (MavRos Ground Control Station) compose. Run from the repo root.
 #
 #   onboard     (default)   On the drone: rosbridge :9090 + ZED map relay + gcs_control. MAVROS, brain and
 #                           barcode are started from the dashboard's Services panel, inside this container.
@@ -19,10 +19,10 @@
 #                           docker/bisg_up.sh starts it when the image and the repo exist.
 #
 # Both use the host network: DDS discovery and the WebSocket port are the host's.
-name: mavros-gcs
+name: mrgcs
 
 x-gcs: &gcs
-  image: mavros-gcs/onboard:jazzy
+  image: mrgcs/onboard:jazzy
   build:
     context: ..
     dockerfile: docker/Dockerfile
@@ -55,6 +55,7 @@ services:
       RMW_IMPLEMENTATION: rmw_cyclonedds_cpp  # bisg_isaac's containers run CycloneDDS
       DRONE_NS: ${DRONE_NS:-/drone_1}
       GCS_SERVICES: brain,barcode             # the sim runs its own MAVROS
+      USE_SIM_TIME: "true"                    # sensor_check.py: flight timing on the sim's /clock
       GCS_WEB_PORT: ${GCS_WEB_PORT:-8090}
     volumes:
       - gcs-data:/data
@@ -76,7 +77,7 @@ services:
       HOME: /tmp
     volumes:
       - ${KINETIX_DIR:-../../kinetix}:/kinetix:rw
-      - ../raspberry/kinetix_bridge.py:/opt/gcs/kinetix_bridge.py:ro
+      - ../onboard/kinetix_bridge.py:/opt/gcs/kinetix_bridge.py:ro
     command: ["python3", "/opt/gcs/kinetix_bridge.py"]
     stop_grace_period: 200s                   # a stop mid-flight lands first (SIGINT to the run, up to ~3 min)
     restart: unless-stopped

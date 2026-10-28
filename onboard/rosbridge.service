@@ -1,8 +1,8 @@
 # rosbridge.service — auto-start rosbridge + GCS control node on every boot.
 #
 # INSTALL (run once on the companion computer — Raspberry Pi or Jetson):
-#   chmod +x ~/drone-gcs/raspberry/rosbridge_boot.sh
-#   sudo cp ~/drone-gcs/raspberry/rosbridge.service /etc/systemd/system/
+#   chmod +x ~/MRGCS/onboard/rosbridge_boot.sh
+#   sudo cp ~/MRGCS/onboard/rosbridge.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable rosbridge   ← auto-start on boot
 #   sudo systemctl start  rosbridge   ← start right now without rebooting
@@ -17,7 +17,7 @@
 #   - gcs_control node            (listens for start/stop commands from the dashboard)
 #
 # Everything else (SLAM, camera, MAVROS, brain) is started on-demand
-# via the "Services" panel in the Drone GCS dashboard.
+# via the "Services" panel in the MRGCS dashboard.
 
 [Unit]
 Description=ROS2 rosbridge + GCS control node

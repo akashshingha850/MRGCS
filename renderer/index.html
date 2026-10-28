@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>mavros gcs</title>
+  <title>MRGCS</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -111,13 +111,22 @@
     .hdr-badge.ok     { background:rgba(61,220,132,.15); color:var(--ok); }
 
     /* ── KINETIX ────────────────────────────────── */
-    #view-kinetix { height:calc(100vh - var(--topbar)); }
-    #view-kinetix.active { display:grid !important; grid-template-columns:300px 1fr; }
-    #kx-side { background:var(--panel); border-right:1px solid var(--border); overflow-y:auto; }
-    #kx-main { display:flex; flex-direction:column; min-width:0; min-height:0; overflow:hidden; }
+    #view-kinetix, #view-sensors { height:calc(100vh - var(--topbar)); }
+    #view-kinetix.active, #view-sensors.active { display:grid !important; grid-template-columns:300px 1fr; }
+    #kx-side, #sn-side { background:var(--panel); border-right:1px solid var(--border); overflow-y:auto; }
+    #kx-main, #sn-main { display:flex; flex-direction:column; min-width:0; min-height:0; overflow:hidden; }
     .kx-field { display:flex; align-items:center; gap:8px; padding:5px 10px; }
     .kx-field label { color:var(--muted); font-size:11px; width:58px; flex-shrink:0; }
     .kx-field select, .kx-field input { flex:1; min-width:0; }
+    .kx-seg { flex:1; display:flex; border:1px solid var(--border); border-radius:4px; overflow:hidden; }
+    .kx-field .kx-seg label { flex:1; width:auto; margin:0; cursor:pointer; }
+    .kx-seg label + label { border-left:1px solid var(--border); }
+    .kx-seg input { display:none; }
+    .kx-seg span { display:block; padding:5px 0; text-align:center; font-size:11px; color:var(--muted); }
+    .kx-seg input:checked + span { background:rgba(77,159,255,.15); color:var(--accent); font-weight:600; }
+    .kx-seg input:disabled + span { opacity:.5; cursor:default; }
+    .kx-note { padding:0 10px 6px 76px; font-size:10px; line-height:1.5; color:var(--muted); }
+    .kx-note code { color:var(--text); }
     #kx-msg { padding:6px 10px; font-size:11px; color:var(--muted); min-height:30px; word-break:break-word; }
     #kx-warn { display:none; margin:6px 10px; padding:6px 8px; border-radius:4px; font-size:11px;
                color:var(--warn); border:1px solid var(--warn); background:rgba(240,165,0,.08); }
@@ -140,8 +149,10 @@
     .kx-chip.warn { color:var(--warn); border-color:var(--warn); }
     .kx-chip.danger { color:var(--danger); border-color:var(--danger); }
     #kx-live-grid { flex:1; min-height:0; display:flex; }
-    #kx-cam-wrap { aspect-ratio:16/9; background:#000; display:flex; }
-    #kx-cam { width:100%; height:100%; object-fit:contain; }
+    #view-kinetix.active { grid-template-columns:300px 1fr 360px; }
+    #kx-cams { background:var(--panel); border-left:1px solid var(--border); overflow-y:auto; }
+    .kx-cam-wrap { aspect-ratio:16/9; background:#000; display:flex; }
+    .kx-cam-wrap canvas { width:100%; height:100%; object-fit:contain; }
     #kx-track-wrap { flex:1; min-width:0; display:flex; }
     #kx-track { width:100%; height:100%; display:block; }
     #kx-log { flex:1 1 0; min-height:50px; margin:0; padding:8px 10px; overflow:auto; background:#0a0e14;
@@ -152,6 +163,46 @@
                   text-align:left; padding:5px 8px; border-bottom:1px solid var(--border); }
     #kx-runs td { padding:4px 8px; border-bottom:1px solid rgba(46,51,64,.5); white-space:nowrap; }
     #kx-runs td.id { font-family:monospace; font-size:10px; }
+    #kx-pane-scan { flex:1 1 0; min-height:0; display:flex; flex-direction:column; }
+    #kx-runs-bar { position:sticky; top:0; z-index:1; display:flex; align-items:center; gap:10px; padding:5px 8px;
+      background:var(--panel); border-bottom:1px solid var(--border); font-size:11px; color:var(--muted); }
+    #kx-runs-bar label { display:flex; align-items:center; gap:4px; cursor:pointer; }
+    #btn-kx-del { margin-left:auto; color:var(--danger); border-color:var(--danger); }
+    #kx-runs th { top:31px; }
+    #kx-scan-wrap { flex:1 1 0; min-height:200px; position:relative; background:#0a0e14; }
+    #kx-scan { position:absolute; inset:0; width:100%; height:100%; display:block; }
+    #kx-scan-key { position:absolute; left:8px; top:6px; font-size:10px; line-height:1.6; color:var(--muted);
+      background:rgba(10,14,20,.75); padding:4px 8px; border-radius:4px; pointer-events:none; }
+    #kx-scan-cams-wrap { flex:0 0 auto; max-height:170px; overflow:auto; border-top:1px solid var(--border); }
+    #kx-scan-cams { width:100%; border-collapse:collapse; font-size:11px; }
+    #kx-scan-cams th { position:sticky; top:0; background:var(--panel); color:var(--muted); font-weight:700; text-align:left; padding:4px 8px; }
+    #kx-scan-cams td { padding:3px 8px; border-bottom:1px solid rgba(46,51,64,.5); white-space:nowrap; }
+    #kx-sfm-info { padding:4px 10px 10px; font-size:11px; line-height:1.7; }
+    #kx-sfm-info b { color:var(--muted); font-weight:600; display:inline-block; width:92px; }
+
+    /* ── SENSORS ────────────────────────────────── */
+    #view-sensors.active { grid-template-columns:340px 1fr; }
+    .sn-btns { display:grid; grid-template-columns:1fr 1fr; gap:5px; padding:7px 10px; }
+    #sn-live, #sn-params { width:100%; border-collapse:collapse; font-size:11px; }
+    #sn-live td, #sn-params td { padding:3px 10px; border-bottom:1px solid rgba(46,51,64,.5); white-space:nowrap; }
+    #sn-live td.g { color:var(--muted); font-weight:700; font-size:10px; letter-spacing:1px; text-transform:uppercase; padding-top:7px; }
+    #sn-live td.hz { color:var(--muted); text-align:right; }
+    #sn-live td.v { text-align:right; font-family:monospace; }
+    #sn-live tr.stale td.v, #sn-live tr.stale td.hz { color:var(--danger); }
+    #sn-params td:last-child { text-align:right; font-family:monospace; }
+    #sn-msg { padding:8px 12px; font-size:12px; color:var(--muted); border-bottom:1px solid var(--border); flex-shrink:0; }
+    #sn-result { flex:1 1 0; overflow:auto; padding:6px 12px 16px; font-size:12px; }
+    .sn-empty { color:var(--muted); padding:20px 0; max-width:60ch; line-height:1.5; }
+    .sn-card { margin:10px 0 4px; }
+    .sn-card h3 { font-size:12px; margin:0 0 2px; }
+    .sn-card .n { color:var(--muted); font-size:11px; line-height:1.45; margin-bottom:4px; max-width:110ch; }
+    .sn-card table { border-collapse:collapse; font-size:11px; }
+    .sn-card td, .sn-card th { padding:3px 10px 3px 0; border-bottom:1px solid rgba(46,51,64,.5); text-align:left; white-space:nowrap; }
+    .sn-card th { color:var(--muted); font-weight:600; }
+    .sn-card td.why { white-space:normal; min-width:240px; }
+    .sn-card .ok { color:var(--ok); } .sn-card .bad { color:var(--danger); } .sn-card .warn { color:var(--warn); }
+    .sn-card tr.chg td { color:var(--accent); font-weight:600; }
+    #sn-paste { margin:6px 0 0; padding:8px 10px; background:#0a0e14; font:11px/1.5 monospace; color:#9aa4b8; white-space:pre; overflow:auto; }
 
     /* ── VIEWS ──────────────────────────────────── */
     .view { display:none; }
@@ -457,9 +508,10 @@
       #conn-popover { top:100%; left:8px; right:8px; min-width:0; }
 
       /* every view: a plain column, height from content */
-      .view, #view-dashboard, #view-navigation, #view-slam, #view-image, #view-kinetix { height:auto !important; }
-      #view-navigation.active, #view-slam.active, #view-image.active, #view-kinetix.active
+      .view, #view-dashboard, #view-navigation, #view-slam, #view-image, #view-kinetix, #view-sensors { height:auto !important; }
+      #view-navigation.active, #view-slam.active, #view-image.active, #view-kinetix.active, #view-sensors.active
         { display:flex !important; flex-direction:column; }
+      #sn-main { overflow:visible; } #sn-result { flex:none; }
 
       /* dashboard: status + commands, camera, map, motors */
       #dash-main { display:flex; flex-direction:column; height:auto; overflow:visible; }
@@ -492,8 +544,9 @@
       #img-side { border-left:none; border-top:1px solid var(--border); overflow:visible; }
 
       /* kinetix */
-      #kx-side { border-right:none; border-bottom:1px solid var(--border); overflow:visible; }
+      #kx-side, #sn-side { border-right:none; border-bottom:1px solid var(--border); overflow:visible; }
       #kx-main { min-height:0; }
+      #kx-cams { border-left:none; border-top:1px solid var(--border); overflow:visible; }
       #kx-plan-wrap { flex:none; flex-direction:column; }
       #kx-plan { height:min(100vw, 380px); }
       #kx-pane-live { flex:none; }
@@ -501,6 +554,8 @@
       #kx-live-grid { flex-direction:column; }
       #kx-track-wrap { flex:none; height:210px; }
       #kx-log { flex:none; height:200px; min-height:0; }
+      #kx-pane-scan { flex:none; }
+      #kx-scan-wrap { flex:none; height:min(100vw, 380px); }
       #kx-runs-wrap { flex:none; height:200px; overflow:auto; }
       #kx-runs th, #kx-runs td { padding:5px 7px; }
 
@@ -514,10 +569,11 @@
 
 <!-- ── TOPBAR ──────────────────────────────────────────── -->
 <header id="topbar">
-  <span class="logo">DRONE <em>GCS</em></span>
+  <span class="logo" title="MavRos Ground Control Station">MR<em>GCS</em></span>
   <nav id="tab-nav">
     <button class="tab-btn"        data-view="kinetix">Kinetix</button>
     <button class="tab-btn active" data-view="dashboard">Dashboard</button>
+    <button class="tab-btn"        data-view="sensors">Sensors</button>
     <button class="tab-btn"        data-view="navigation">Navigation</button>
     <button class="tab-btn"        data-view="slam">SLAM</button>
     <button class="tab-btn"        data-view="image">Image Processing</button>
@@ -542,6 +598,7 @@
     <span class="hdr-badge" id="hdr-armed">DISARMED</span>
     <span class="hdr-badge" id="hdr-mode">—</span>
     <span class="hdr-badge" id="hdr-gps">NO GPS</span>
+    <span class="hdr-badge" id="hdr-zed">ZED —</span>
   </div>
 </header>
 
@@ -857,19 +914,20 @@
     <div class="srow"><span class="sk">Run</span>     <span class="sv" id="kx-run" style="font-size:10px;font-family:monospace">—</span></div>
     <div class="srow"><span class="sk">Elapsed</span> <span class="sv" id="kx-elapsed">—</span></div>
     <div id="kx-warn"></div>
-    <div class="ph">Chase view</div>
-    <div id="kx-cam-wrap"><canvas id="kx-cam" width="640" height="360"></canvas></div>
 
     <div class="ph" style="margin-top:4px">New capture</div>
     <div class="kx-field"><label>Scene</label>  <select id="kx-scene" class="cmd-input"></select></div>
     <div class="kx-field"><label>Method</label> <select id="kx-method" class="cmd-input"></select></div>
     <div class="kx-field"><label>Seed</label>   <input id="kx-seed" type="number" value="0" min="0" step="1" class="cmd-input"></div>
-    <div class="kx-field" title="Kinetix flies a short exploration with the ZED depth, fits the room's walls and obstacles, then plans the tour on that: no scene file needed. Tour method only.">
-      <label>Room</label>
-      <label style="width:auto;display:flex;align-items:center;gap:6px;color:var(--text);font-size:11px">
-        <input id="kx-explore" type="checkbox" style="flex:none;width:auto"> explore it first
-      </label>
+    <div class="kx-field" id="kx-arm-row" style="display:none" title="Tour = one flight: Kinetix explores the room with the ZED depth, fits its walls and obstacles, then scans it. Benchmark arm = how the scan uses the exploration. The run folder is named after it.">
+      <label>Scan</label>
+      <div class="kx-seg">
+        <label><input type="radio" name="kx-arm" value="optimized" checked><span>Optimized</span></label>
+        <label><input type="radio" name="kx-arm" value="traditional"><span>Traditional</span></label>
+      </div>
     </div>
+    <div class="kx-note" id="kx-arm-hint" style="display:none"></div>
+    <div class="kx-note" id="kx-save" title="Kinetix names the run folder runs/&lt;time&gt;_&lt;scene&gt;_&lt;method&gt;_&lt;rig&gt;_s&lt;seed&gt;"></div>
     <div style="padding:7px 10px;display:flex;flex-direction:column;gap:5px">
       <button id="btn-kx-run"   class="cmd-btn ok">Start scan</button>
       <button id="btn-kx-abort" class="cmd-btn danger">Abort → return &amp; land</button>
@@ -881,10 +939,17 @@
     </div> -->
     <div class="ph">Analysis</div>
     <div id="kx-plan-info">No run yet.</div>
+    <div class="ph">Reconstruction</div>
+    <div class="kx-field"><label>Run</label> <select id="kx-sfm-run" class="cmd-input"></select></div>
+    <div style="padding:7px 10px;display:grid;grid-template-columns:1fr 1fr;gap:5px">
+      <button id="btn-kx-sfm" class="cmd-btn" title="kinetix sfm on this run: SIFT + matching + known-pose triangulation and bundle adjustment (CPU, 1-2 min for a tour). Not while a scan flies.">Reconstruct</button>
+      <button id="btn-kx-cloud" class="cmd-btn" title="Load the sparse cloud and every camera into the Scan 3D tab, coloured by its error against ground truth">Show in 3D</button>
+    </div>
+    <div id="kx-sfm-info">—</div>
   </div>
   <div id="kx-main">
     <div class="ph" id="kx-tabs">
-      <button class="kx-tab active" data-pane="kx-pane-live">Live</button><button class="kx-tab" data-pane="kx-log">Log</button><button class="kx-tab" data-pane="kx-runs-wrap">Runs</button>
+      <button class="kx-tab active" data-pane="kx-pane-live">Live</button><button class="kx-tab" data-pane="kx-log">Log</button><button class="kx-tab" data-pane="kx-runs-wrap">Runs</button><button class="kx-tab" data-pane="kx-pane-scan">Scan 3D</button>
       <span id="kx-plan-run" style="font-family:monospace;text-transform:none;letter-spacing:0;margin-left:auto;align-self:center"></span>
     </div>
     <div id="kx-pane-live" class="kx-pane">
@@ -901,12 +966,62 @@
       <div id="kx-chips"></div>
     </div>
     <pre id="kx-log" class="kx-pane" style="display:none">Waiting for kinetix_bridge (/gcs/kinetix/status)…</pre>
+    <div id="kx-pane-scan" class="kx-pane" style="display:none">
+      <div id="kx-scan-wrap"><canvas id="kx-scan"></canvas><div id="kx-scan-key">Reconstruct a run, then Show in 3D.</div></div>
+      <div id="kx-scan-cams-wrap">
+        <table id="kx-scan-cams">
+          <thead><tr><th>Worst cameras</th><th>SfM err m</th><th>EKF2 err m</th><th>3D points</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
     <div id="kx-runs-wrap" class="kx-pane" style="display:none">
+      <div id="kx-runs-bar">
+        <label><input type="checkbox" id="kx-runs-all"> all</label>
+        <span id="kx-runs-sel">none selected</span>
+        <button id="btn-kx-del" class="cmd-btn-sm" disabled title="Deletes the run folders: images, depth, rosbag and reconstruction. Click twice. Not the run of a job that is running.">Delete selected</button>
+      </div>
       <table id="kx-runs">
-        <thead><tr><th>Run</th><th>Method</th><th>Frames</th><th>Stop</th><th>Coverage</th>
-          <th>Travel m</th><th>Wall s</th></tr></thead>
+        <thead><tr><th></th><th>Run</th><th>GB</th><th>Method</th><th>Frames</th><th>Stop</th><th>Coverage</th>
+          <th>Travel m</th><th>Wall s</th><th>SfM reg.</th><th>Cam err median / max m</th><th>Complete</th></tr></thead>
         <tbody></tbody>
       </table>
+    </div>
+  </div>
+  <div id="kx-cams">
+    <div class="ph">Chase view</div>
+    <div class="kx-cam-wrap"><canvas id="kx-cam" width="640" height="360"></canvas></div>
+    <div class="ph">ZED left</div>
+    <div class="kx-cam-wrap"><canvas id="kx-rgb" width="640" height="360"></canvas></div>
+    <div class="ph">Depth <span class="img-key">blue near · red far (0.3–10 m)</span></div>
+    <div class="kx-cam-wrap"><canvas id="kx-depth" width="640" height="360"></canvas></div>
+    <div class="ph">Depth confidence <span class="img-key">blue reliable · red unreliable</span></div>
+    <div class="kx-cam-wrap"><canvas id="kx-conf" width="640" height="360"></canvas></div>
+  </div>
+</section>
+
+<section class="view" id="view-sensors">
+  <div id="sn-side">
+    <div class="ph">Sensors <span style="font-weight:400;letter-spacing:0;text-transform:none">· which source EKF2 should trust (calibrations: QGC)</span></div>
+    <div class="srow"><span class="sk">Node</span><span class="sv" id="sn-node">offline</span></div>
+    <div class="sn-btns">
+      <button id="btn-sn-check" class="cmd-btn ok" title="Double-click. Takes off in OFFBOARD, hovers, turns 360° in 45° steps and back, climbs and descends 0.6 m, flies a 1 m square (forward, left, back), lands on the start point. Needs ~2 m clear ahead and to the left.">Analyse flight</button>
+      <button id="btn-sn-record" class="cmd-btn" title="Motors off: carry the drone, turn it slowly through 360° pausing every 45°, lift and lower it, then Stop.">Record by hand</button>
+      <button id="btn-sn-stop" class="cmd-btn danger" style="grid-column:1 / -1">Stop · abort → land</button>
+    </div>
+    <div class="kx-note" style="padding-left:10px">Analyse flight: ground 5 s (motors off), climb 1.5 m, hover, 16 yaw steps of 45°,
+      ±0.6 m height step, 1 m square at 0.3 m/s, land on the start point, ground 5 s. ~3 min. Every step holds 4 s, like a
+      Kinetix capture. Vibration needs MAVROS with <code>MAVROS_PLUGINS=lean+debug</code>.</div>
+    <div class="ph">Live sources</div>
+    <table id="sn-live"></table>
+    <div class="ph">EKF2 now</div>
+    <table id="sn-params"></table>
+  </div>
+  <div id="sn-main">
+    <div id="sn-msg">—</div>
+    <div id="sn-result">
+      <div class="sn-empty">No run yet. Analyse flight (or Record by hand) compares every source of heading, height and velocity
+        and says which EKF2 should fuse.</div>
     </div>
   </div>
 </section>

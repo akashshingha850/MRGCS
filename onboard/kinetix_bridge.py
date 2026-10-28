@@ -7,8 +7,9 @@ service `kinetix-bridge`), and drives Kinetix only through its CLI, one job at
 a time:
 
   run    python3 -m kinetix run --scene config/scenes/<scene>.yaml --method <m> --rig mavros --seed <n>
-  abort  SIGINT to the running job — Kinetix's Ctrl+C path: the rig flies home
-         at a safe height, lands (AUTO.LAND) and disarms
+  sfm    python3 -m kinetix sfm runs/<run>   (reconstruct a flown run: <run>/sfm/offline/)
+  abort  SIGINT to the running job — for a flight Kinetix's Ctrl+C path: the rig
+         flies home at a safe height, lands (AUTO.LAND) and disarms
 
 Kinetix streams the setpoints itself and only one setpoint producer may run per
 drone, so `run` is refused while anything else publishes
@@ -17,12 +18,21 @@ drone, so `run` is refused while anything else publishes
 Subscribes:  /gcs/kinetix/cmd     std_msgs/String  {"action":"run","scene":"warehouse_room","method":"tour","seed":0,"explore":false}
                                                    explore: true = tour only; Kinetix first explores the room with the ZED depth
                                                    (`--explore`) and plans the tour on what it found, not on the scene file's room
+                                                   reuse (explore only, default true): optimized = the exploration views count, the tour
+                                                   flies the gaps; false = traditional, the tour scans from scratch (explore.reuse_views=false).
+                                                   The run dir is named ..._tour-explore-optimized_... / ..._tour-explore-traditional_...
+                                                   {"action":"sfm","run":"<run id>"}   reconstruct (refused while any job runs)
+                                                   {"action":"cloud","run":"<run id>"} send that run's reconstruction once on /gcs/kinetix/cloud
+                                                   {"action":"delete","runs":["<run id>", ...]} remove those run folders (frames, depth, rosbag,
+                                                   reconstruction); never the run of a job that is running
                                                    {"action":"abort"}
 Publishes:   /gcs/kinetix/status  std_msgs/String  JSON @ 1 Hz: state, job, log tail, scenes, methods, recent runs
-                                                   (run.yaml summary), tol (Kinetix's capture tolerances), plan (viewpoints + flown path of the active or
-                                                   newest run, in the scene's map frame), setpoint producers (count and node names), last message
-
-Planning and results only: the GCS does no post-processing (no SfM / reconstruction).
+                                                   (run.yaml summary + sfm/offline/metrics.json), tol (Kinetix's capture tolerances), plan (viewpoints +
+                                                   flown path of the active or newest run, in the scene's map frame), setpoint producers (count and node
+                                                   names), last message
+             /gcs/kinetix/cloud   std_msgs/String  JSON, on request: the sparse cloud (points.ply, map frame, cm) and every camera:
+                                                   SfM centre (map frame, like the cloud), ground truth and EKF2 centre, its error against
+                                                   ground truth after the Sim3 fit metrics.json uses, and its 3D point count
 
 Environment: KINETIX_DIR (/kinetix), DRONE_NS (/drone_1)
 """
@@ -31,6 +41,7 @@ import collections
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -46,8 +57,9 @@ from std_msgs.msg import String
 KX       = Path(os.environ.get('KINETIX_DIR', '/kinetix'))
 DRONE_NS = os.environ.get('DRONE_NS', '/drone_1')
 SP_TOPIC = f'{DRONE_NS}/mavros/setpoint_position/local'
-N_RUNS   = 8
+N_RUNS   = 40           # runs listed (newest first): the Runs tab deletes from this list
 N_PATH   = 150          # flown-path points sent to the GCS (a tour has ~400 frames)
+N_CLOUD  = 60000        # sparse points sent to the GCS at most (~1.3 MB of JSON)
 LABEL    = re.compile(r'x([+-]?[\d.]+)_y([+-]?[\d.]+)_z([+-]?[\d.]+)_h(\d+)')   # Kinetix viewpoint id
 
 try:
@@ -92,6 +104,7 @@ class KinetixBridge(Node):
     def __init__(self):
         super().__init__('kinetix_bridge')
         self._pub   = self.create_publisher(String, '/gcs/kinetix/status', 10)
+        self._cloud_pub = self.create_publisher(String, '/gcs/kinetix/cloud', 1)
         self.create_subscription(String, '/gcs/kinetix/cmd', self._on_cmd, 10)
 
         self._lock  = threading.Lock()
@@ -103,6 +116,7 @@ class KinetixBridge(Node):
         self._runs  = []
         self._runs_t = 0.0
         self._plan_key, self._plan_cache = None, None
+        self._sizes = {}              # run id -> (dir mtimes, bytes)
         self._tol = _tolerances()
 
         self.create_timer(1.0, self._publish)
@@ -119,6 +133,12 @@ class KinetixBridge(Node):
             self._do_abort()
         elif action == 'run':
             self._do_run(d)
+        elif action == 'sfm':
+            self._do_sfm(d)
+        elif action == 'delete':
+            self._do_delete(d)
+        elif action == 'cloud':
+            threading.Thread(target=self._send_cloud, args=(str(d.get('run', '')),), daemon=True).start()
 
     def _producers(self):
         """Nodes publishing setpoints to the drone right now, e.g. ['/drone_1/brain_node']."""
@@ -141,6 +161,7 @@ class KinetixBridge(Node):
         if method not in METHODS:
             return self._say(f'refused: unknown method "{method}"')
         explore = bool(d.get('explore'))
+        reuse = explore and d.get('reuse', True) is not False       # benchmark arm: optimized (reuse the views) / traditional
         if explore and method != 'tour':
             return self._say('refused: exploring the room first works with the tour method only')
         producers = self._producers()
@@ -148,18 +169,69 @@ class KinetixBridge(Node):
             return self._say(f'refused: other setpoint producer(s) on {SP_TOPIC}: {", ".join(producers)} '
                              '— stop them first (a stuck Kinetix run? the brain node?)')
         self._start('run', ['python3', '-m', 'kinetix', 'run', '--scene', f'config/scenes/{scene}.yaml',
-                            '--method', method, '--rig', 'mavros', '--seed', str(seed)] + (['--explore'] if explore else []),
-                    scene=scene, method=method, seed=seed, explore=explore)
+                            '--method', method, '--rig', 'mavros', '--seed', str(seed)]
+                    + (['--explore'] + ([] if reuse else ['explore.reuse_views=false']) if explore else []),
+                    scene=scene, method=method, seed=seed, explore=explore, reuse=reuse)
+
+    def _do_sfm(self, d):
+        run = str(d.get('run', ''))
+        if self._busy():
+            return self._say(f'refused: a {self._job["kind"]} job is running')
+        if run not in {p.name for p in self._run_dirs()}:             # a run id, never a path
+            return self._say(f'refused: unknown run "{run}"')
+        if not (KX / 'runs' / run / 'frames.jsonl').exists():
+            return self._say(f'refused: {run} has no frames to reconstruct')
+        try:
+            scene = (yaml.safe_load((KX / 'runs' / run / 'run.yaml').read_text()) or {}).get('scene')
+        except Exception:
+            scene = None
+        self._start('sfm', ['python3', '-m', 'kinetix', 'sfm', f'runs/{run}'], run=run, scene=scene)
+
+    def _do_delete(self, d):
+        ids = d.get('runs')
+        if not isinstance(ids, list) or not ids:
+            return self._say('refused: no runs to delete')
+        known = {p.name for p in self._run_dirs()}
+        active = self._job.get('run') if self._busy() and self._job else None
+        bad = [r for r in ids if not isinstance(r, str) or r not in known]               # run ids only, never a path
+        if bad:
+            return self._say(f'refused: unknown run(s) {", ".join(map(str, bad))}')
+        if active in ids:
+            return self._say(f'refused: {active} belongs to the running {self._job["kind"]} job')
+        threading.Thread(target=self._delete, args=(ids,), daemon=True).start()          # a rosbag is GBs: off the executor
+
+    def _delete(self, ids):
+        freed, failed = 0, []
+        for r in ids:
+            freed += self._size(KX / 'runs' / r)
+            try:
+                shutil.rmtree(KX / 'runs' / r)
+            except OSError as e:
+                failed.append(f'{r} ({e.strerror})')
+        self._runs_t, self._plan_key = 0.0, None                  # refresh the list and the plan view now
+        self._say(f'deleted {len(ids) - len(failed)} run(s), {freed / 1e9:.1f} GB freed'
+                  + (f'; failed: {", ".join(failed)}' if failed else ''))
+
+    @staticmethod
+    def _size(path):
+        total = 0
+        for root, _, files in os.walk(path):
+            for f in files:
+                try:
+                    total += os.lstat(os.path.join(root, f)).st_size
+                except OSError:
+                    pass
+        return total
 
     def _do_abort(self):
         if not self._busy():
             return self._say('nothing to abort')
         if self._abort:
-            return self._say('already aborting — Kinetix is flying home and landing')
+            return self._say('already aborting')
         self._abort = True
         # SIGINT = Ctrl+C: Kinetix raises KeyboardInterrupt, its finally lands and disarms (SIGTERM would skip that)
         self._proc.send_signal(signal.SIGINT)
-        self._say(f'abort sent to {self._job["kind"]} (SIGINT): returning home and landing')
+        self._say(f'abort sent to {self._job["kind"]} (SIGINT)' + (': returning home and landing' if self._job['kind'] == 'run' else ''))
 
     def _start(self, kind, argv, **job):
         self._log.clear()
@@ -203,12 +275,31 @@ class KinetixBridge(Node):
         for p in self._run_dirs()[:N_RUNS]:
             r = {'id': p.name}
             try:
+                key = (p.name, p.stat().st_mtime, (p / 'sfm').stat().st_mtime if (p / 'sfm').exists() else 0)
+                live = self._busy() and self._job and self._job.get('run') == p.name   # still growing below the top level
+                if live or self._sizes.get(p.name, (None,))[0] != key:    # a finished run does not change: walk it once
+                    self._sizes[p.name] = (key, self._size(p))
+                r['size_gb'] = round(self._sizes[p.name][1] / 1e9, 2)
+            except OSError:                                               # deleted meanwhile
+                pass
+            try:
                 y = yaml.safe_load((p / 'run.yaml').read_text()) or {}
                 s = y.get('summary') or {}
-                r.update(scene=y.get('scene'), method=y.get('method'), frames=s.get('frames'),
+                ex = (y.get('config') or {}).get('explore') or {}   # no reuse_views key = flown before it existed = traditional
+                arm = (' · explore ' + ('optimized' if ex.get('reuse_views', False) else 'traditional')) if ex.get('enabled') else ''
+                r.update(scene=y.get('scene'), method=(y.get('method') or '') + arm, frames=s.get('frames'),
                          stop=s.get('stop_reason'), coverage=s.get('coverage'), wall_s=s.get('wall_s'),
                          travel_m=s.get('travel_m'))
             except Exception:
+                pass
+            try:
+                m = json.loads((p / 'sfm' / 'offline' / 'metrics.json').read_text())
+                gt, cp = m.get('ate_vs_gt') or {}, m.get('completeness_proxy') or {}
+                r['sfm'] = {'registered': m.get('registered'), 'frames': m.get('n_frames'), 'points': m.get('points3D'),
+                            'reproj_px': m.get('mean_reproj_error_px'), 'ate_median_m': gt.get('median_m'),
+                            'ate_rmse_m': gt.get('rmse_m'), 'ate_max_m': gt.get('max_m'), 'ekf2_vs_gt_m': m.get('ekf2_vs_gt_m'),
+                            'completeness': cp.get('all'), 'walls': cp.get('walls')}
+            except (OSError, ValueError):
                 pass
             out.append(r)
         self._runs, self._runs_t = out, time.time()
@@ -225,6 +316,11 @@ class KinetixBridge(Node):
         out = {k: y[k] for k in ('roi', 'workspace') if isinstance(y.get(k), dict)}
         out['no_fly'] = [b for b in (y.get('no_fly') or []) if isinstance(b, dict)]
         out['explored'] = bool(fitted and fitted.exists())
+        if out['explored']:                                       # the scene file's room too: the GCS draws how far off the fit is
+            try:
+                out['truth_roi'] = (yaml.safe_load((KX / 'config' / 'scenes' / f'{scene}.yaml').read_text()) or {}).get('roi')
+            except Exception:
+                pass
         return out
 
     def _plan(self, run_id, scene):
@@ -272,13 +368,56 @@ class KinetixBridge(Node):
             pass
         return out
 
+    # ── reconstruction for the 3D view ─────────────────────────────────────────
+    def _send_cloud(self, run):
+        try:
+            self._cloud_pub.publish(String(data=json.dumps(self._cloud(run))))
+        except Exception as e:                                    # a missing / half-written reconstruction
+            self._cloud_pub.publish(String(data=json.dumps({'run': run, 'error': str(e)})))
+
+    def _cloud(self, run):
+        import numpy as np
+        import pycolmap                                           # the kinetix image has it (kinetix sfm)
+        from kinetix.recon.align import apply, umeyama
+        if run not in {p.name for p in self._run_dirs()}:
+            raise ValueError(f'unknown run "{run}"')
+        d = KX / 'runs' / run
+        off = d / 'sfm' / 'offline'
+        if not (off / 'points.ply').exists():
+            raise ValueError('not reconstructed yet')
+        with open(off / 'points.ply') as f:                      # ascii: x y z r g b, map frame (kinetix sfm aligns it to EKF2)
+            n_head = next(i for i, line in enumerate(f, 1) if line.strip() == 'end_header')
+        P = np.loadtxt(off / 'points.ply', skiprows=n_head, ndmin=2)
+        if len(P) > N_CLOUD:
+            P = P[np.random.default_rng(0).choice(len(P), N_CLOUD, replace=False)]
+        frames = {f['image']: f for f in self._jsonl(d / 'frames.jsonl')}
+        rec = max((pycolmap.Reconstruction(str(m)) for m in (off / 'sparse').iterdir()), key=lambda r: r.num_reg_images())
+        rows = [(frames[i.name], np.asarray(i.projection_center()), i.num_points3D) for i in rec.images.values()
+                if i.has_pose and i.name in frames]
+        S = np.array([r[1] for r in rows])
+        E = np.array([r[0]['pose']['p'] for r in rows])
+        cams = {'idx': [r[0]['idx'] for r in rows], 'points': [int(r[2]) for r in rows]}
+        if len(rows) >= 3:
+            s, R, t = umeyama(S, E)
+            cams['sfm'] = np.round(apply(s, R, t, S), 2).tolist()          # in the cloud's frame
+            cams['ekf'] = np.round(E, 2).tolist()
+            if all(r[0].get('gt_pose') for r in rows):
+                G = np.array([r[0]['gt_pose']['p'] for r in rows])
+                s, R, t = umeyama(S, G)                                    # as metrics.json ate_vs_gt
+                cams['err_m'] = np.round(np.linalg.norm(apply(s, R, t, S) - G, axis=1), 3).tolist()
+                cams['ekf_err_m'] = np.round(np.linalg.norm(E - G, axis=1), 3).tolist()
+                cams['gt'] = np.round(G, 2).tolist()
+        rgb = (P[:, 3].astype(int) << 16) | (P[:, 4].astype(int) << 8) | P[:, 5].astype(int)
+        return {'run': run, 'n_total': int(rec.num_points3D()), 'xyz_cm': np.round(P[:, :3] * 100).astype(int).ravel().tolist(),
+                'rgb': rgb.tolist(), 'cams': cams}
+
     # ── status (1 Hz) ─────────────────────────────────────────────────────────
     def _publish(self):
         busy = self._busy()
         if not busy:
             state = 'idle'
         else:
-            state = 'aborting' if self._abort else 'flying'
+            state = 'aborting' if self._abort else ('reconstructing' if self._job['kind'] == 'sfm' else 'flying')
         with self._lock:
             log = list(self._log)
             job = dict(self._job) if self._job else None

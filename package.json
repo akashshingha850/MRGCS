@@ -1,15 +1,15 @@
 {
-  "name": "drone-gcs",
+  "name": "mrgcs",
   "version": "1.0.0",
-  "description": "Drone Ground Control Station — Electron frontend for ROS2",
+  "description": "MRGCS (MavRos Ground Control Station) — Electron frontend for ROS 2 + MAVROS",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
     "build": "electron-builder"
   },
   "build": {
-    "appId": "com.dron.gcs",
-    "productName": "Drone GCS",
+    "appId": "com.mrgcs.app",
+    "productName": "MRGCS",
     "directories": { "output": "dist" },
     "linux":   { "target": "AppImage" },
     "win":     { "target": "nsis" },

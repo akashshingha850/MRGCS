@@ -1,6 +1,6 @@
 # renderer/ — GCS Frontend (Electron)
 
-The Drone GCS user interface — a single-page Electron renderer that connects to the drone's companion computer (Raspberry Pi or Jetson) over a rosbridge WebSocket and visualises all telemetry, video, and sensor data in real time.
+The MRGCS (MavRos Ground Control Station) user interface — a single-page Electron renderer that connects to the drone's companion computer (Raspberry Pi or Jetson) over a rosbridge WebSocket and visualises all telemetry, video, and sensor data in real time.
 
 No ROS installation is required on the operator's laptop. The app runs on **Windows, Linux, and macOS**.
 
@@ -17,7 +17,7 @@ Defines the four-tab layout, all panel structure, and global styles. Tabs:
 | **NAVIGATION** | Artificial horizon, compass, altitude/speed/vspeed charts, flight data table |
 | **SLAM** | Visual-inertial SLAM from the ZED stereo camera (no lidar): spatial map as a WebGL point cloud, ZED VIO pose, mapping on/off, PCD export |
 | **IMAGE PROCESSING** | ZED RGB, depth and confidence images (depth / confidence as JPEGs from `zed_image_relay.py`), the barcode camera, detection inventory list, DB log, volumetry panel |
-| **KINETIX** | Whole-room photogrammetry: start a scan (scene / method / seed / explore-first), abort → land, live log, live flight panel (ZED left image, FCU / battery / ZED health, distance / speed / height / yaw error vs Kinetix's capture tolerances, 30 s plot), plan & result map (planned viewpoints, captured path, room box, live drone / trail / setpoint), recent runs (`/gcs/kinetix/*`, `kinetix_bridge.py`) |
+| **KINETIX** | Whole-room photogrammetry: start a scan (scene / method / seed / explore-first), abort → land, live log, live flight panel (ZED left image, FCU / battery / ZED health, distance / speed / height / yaw error vs Kinetix's capture tolerances, 30 s plot), plan & result map (planned viewpoints, captured path, room box, live drone / trail / setpoint), recent runs, reconstruction (`kinetix sfm` on a run) and the **Scan 3D** view of its sparse cloud with the cameras coloured by error against ground truth (`/gcs/kinetix/*`, `kinetix_bridge.py`) |
 
 ---
 

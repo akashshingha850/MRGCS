@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.6
-# mavros-gcs/onboard — the drone-side ROS 2 stack: rosbridge (:9090) + ZED map relay + gcs_control + MAVROS
+# mrgcs/onboard — the drone-side ROS 2 stack: rosbridge (:9090) + ZED map relay + gcs_control + MAVROS
 # (+ the brain / barcode nodes gcs_control starts on demand). Builds natively on arm64 (Jetson) and x86_64.
 #
 # Build (repo root):  docker compose -f docker/compose.yaml build
@@ -22,9 +22,9 @@ RUN pip3 install --break-system-packages --no-cache-dir pyzbar
 # MAVROS aborts at start without the GeographicLib geoid / gravity / magnetic datasets
 RUN /opt/ros/jazzy/lib/mavros/install_geographiclib_datasets.sh
 
-COPY raspberry/ /opt/gcs/raspberry/
+COPY onboard/  /opt/gcs/onboard/
 COPY renderer/  /opt/gcs/renderer/
-RUN chmod +x /opt/gcs/raspberry/*.sh /opt/gcs/raspberry/*.py
+RUN chmod +x /opt/gcs/onboard/*.sh /opt/gcs/onboard/*.py
 
 # Logs (~/gcs_logs) and the mission DB (~/brain_data.db) go to the /data volume
 ENV HOME=/data
@@ -32,4 +32,4 @@ WORKDIR /data
 
 # rosbridge + map relay + web app (GCS_WEB_PORT) + gcs_control; the dashboard starts the rest
 ENV GCS_WEB_PORT=8090
-CMD ["bash", "/opt/gcs/raspberry/rosbridge_boot.sh"]
+CMD ["bash", "/opt/gcs/onboard/rosbridge_boot.sh"]

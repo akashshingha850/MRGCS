@@ -1,4 +1,4 @@
-# Drone GCS — Autonomous Ground Control Station
+# MRGCS — MavRos Ground Control Station
 
 > A full-stack UAV ground control system built on **Electron + ROS2**, running on the drone's **companion computer** with a **ZED stereo camera** and streaming all telemetry, video, and map data to a laptop over Wi-Fi in real time.
 
@@ -44,7 +44,7 @@ The system can autonomously fly a programmed waypoint route, scan a warehouse fo
 ## Repository Structure
 
 ```
-drone-gcs/
+MRGCS/
 ├── main.js              ← Electron main process (window, menu, IPC)
 ├── preload.js           ← Renderer ↔ main bridge (contextBridge)
 ├── renderer/            ← Frontend application (runs in the Electron window)
@@ -52,7 +52,7 @@ drone-gcs/
 │   ├── app.js           ← All application logic (ROS subscriptions, charts, map)
 │   └── lib/roslib.js    ← ROSLIB.js (WebSocket ↔ ROS bridge client)
 ├── docker/              ← Onboard stack image + compose (onboard, bisg sim)
-├── raspberry/           ← Onboard software (companion computer; folder name kept from the Pi era)
+├── onboard/             ← Onboard software (the companion computer: Raspberry Pi or Jetson)
 │   ├── gcs_control.py       ← ROS2 service manager (start/stop nodes on demand)
 │   ├── barcode_detector.py  ← Barcode/QR detection + ZED position overlay
 │   ├── brain_node.py        ← Autonomous waypoint mission planner
@@ -60,10 +60,12 @@ drone-gcs/
 │   ├── mavros_streams.py    ← Requests telemetry stream rates on FCU connect
 │   ├── zed_map_relay.py     ← ZED spatial map → downsampled cloud for the GCS
 │   ├── kinetix_bridge.py    ← Kinetix tab backend (runs the Kinetix CLI in its own image)
+│   ├── sensor_check.py      ← Sensors tab backend (live sources, analyse flight, recording)
+│   ├── sensor_analysis.py   ← Sensors tab analysis: which source EKF2 should fuse (numpy only)
 │   ├── start_all.sh         ← One-command full stack launcher
 │   ├── rosbridge_boot.sh    ← rosbridge_server startup script
 │   ├── rosbridge.service    ← systemd service (auto-start on boot)
-│   └── drone-gcs.service    ← systemd service for gcs_control
+│   └── mrgcs.service        ← systemd service for gcs_control
 └── docs/
     ├── Drone_GCS_Manual.pdf         ← Full technical manual
     ├── Drone_GCS_Presentation.pptx  ← Client presentation deck
@@ -92,9 +94,16 @@ The most operationally valuable module. The `barcode_detector.py` node subscribe
 
 
 ### 5 · Kinetix (whole-room photogrammetry)
-Buttons for the Kinetix capture pipeline: pick a scene, method (`tour` ≈ 5 min, `roi_coverage` ≈ 25 min) and seed, optionally tick **explore it first** (tour only: Kinetix first flies a short exploration with the ZED depth, fits the room's walls and obstacles, and plans the tour on that instead of the scene file; the tab shows the exploration progress, the fitted room and the obstacles it found), **Start scan** (double-click — it arms and flies), **Abort** (Kinetix flies home, lands and disarms). The tab shows the job's state, elapsed time and live log; a **live flight** panel with the ZED left image (what Kinetix captures), mode / armed / FCU link / battery / ZED-stack health chips, and how well the drone holds the setpoint Kinetix streams (distance, speed = motion blur, height and yaw error against Kinetix's own capture tolerances, with an *in tolerance* indicator and a 30 s plot); a top-down **plan & result** view of the planned viewpoints, the path captured, the room box and, while flying, the drone, its trail and the setpoint; and a table of recent runs (frames, stop reason, coverage, distance flown, wall time). Planning and results only: no reconstruction or other post-processing in the GCS. Start is refused while anything else streams setpoints to the drone. Backed by `kinetix_bridge.py`, which runs the Kinetix CLI inside Kinetix's own Docker image.
+Buttons for the Kinetix capture pipeline: pick a scene, method (`tour` ≈ 5 min, `roi_coverage` ≈ 25 min) and seed, for `tour`, Kinetix explores the room and scans it in one flight (a short exploration with the ZED depth fits the room's walls and obstacles, then the tour is planned on that instead of the scene file); pick the **Scan** arm for benchmarking: *optimized* (the exploration views count as coverage and go to SfM, the tour flies only the gaps) or *traditional* (exploration only maps, the tour scans the whole room); the run folder is named `..._tour-explore-optimized_...` / `..._tour-explore-traditional_...` and the runs table shows the arm; the tab shows the exploration progress, the fitted room (grey), the flight volume (dashed: the camera height band, so it stops well below a high ceiling), the obstacles it found (red) and the scene file's room (cyan dashed) to see how far off the fit is; **Start scan** (double-click — it arms and flies), **Abort** (Kinetix flies home, lands and disarms). The tab shows the job's state, elapsed time and live log; a **live flight** panel with the ZED left image (what Kinetix captures) and how well the drone holds the setpoint Kinetix streams (distance, speed = motion blur, height and yaw error against Kinetix's own capture tolerances, with an *in tolerance* indicator and a 30 s plot); a top-down **plan & result** view of the planned viewpoints, the path captured, the room box and, while flying, the drone, its trail and the setpoint; and a table of recent runs (size on disk, frames, stop reason, coverage, distance flown, wall time, and once reconstructed: images registered, camera error against ground truth, completeness); tick runs (or *all*) and **Delete selected** (click twice) to remove their folders — images, depth, rosbag, reconstruction; the run of a job that is running cannot be deleted. **Reconstruction**: pick a run, **Reconstruct** runs `kinetix sfm` on it (CPU, ~1-2 min for a tour; refused while a scan flies) and **Show in 3D** loads its sparse cloud into the **Scan 3D** tab with every camera coloured by its error against ground truth (green ≤ 0.25 m … red ≥ 1 m; white = the ground-truth centres) and a list of the worst cameras: one with few 3D points is weakly held and bundle adjustment can move it far off. Start is refused while anything else streams setpoints to the drone. Backed by `kinetix_bridge.py`, which runs the Kinetix CLI inside Kinetix's own Docker image.
 
 ---
+
+### 6 · Sensors (which source EKF2 should trust)
+Calibrations stay in QGC. This tab measures, on this drone in this room, which source EKF2 should fuse: **heading** (magnetometer vs the ZED: VIO, plus the bridge's wall compass when it is on), **height** (baro vs LW20 range vs ZED), **horizontal velocity** (optical flow vs ZED), and the **IMU** (noise at rest and hovering, PX4's vibration metrics and accel clipping, FCU vs ZED IMU). It also measures what Kinetix needs: the **ZED latency** (stamp delay behind the FCU gyro, i.e. the EV delay EKF2 should use), the **EV lever arm** (sim), how long the drone takes to settle inside **Kinetix's capture tolerances** after each step, the **motion blur** at those moments, the **EKF2 pose error at capture** (sim) and whether the **room** suits the ZED and the wall compass. Live: every source's rate and latest value, plus the EKF2 params now on the FCU.
+
+**Analyse flight** (double-click) takes off in OFFBOARD and runs: 5 s on the ground (motors off), climb 1.5 m, hover, 16 yaw steps of 45°, a ±0.6 m height step, a 1 m square at 0.3 m/s (forward, left, back), land on the start point, 5 s on the ground. Every step holds 4 s, like a Kinetix capture (~3 min; needs ~2 m clear ahead and to the left; abort lands from where it is; a pilot mode change ends it). **Record by hand** records while you carry, turn and lift the drone with the motors off. The result is the **EKF2 params to set**, each with its reason, against the current ones, as `param set` lines for the QGC MAVLink console, followed by the tables behind it.
+
+Without ground truth, headings are judged by their error per 45° step against the FCU gyro integrated over the step (well under 1° of gyro drift), which is where VIO slips and magnetometer deviation show. Heights are judged by a three-cornered hat over baro, range and ZED. Velocities use the same hat over flow, ZED and EKF2; this one is approximate, because EKF2 fuses the other two. Absolute checks: the height after landing on the take-off floor should be 0, and each source's start → landing displacement can be compared with a tape measurement of the real landing offset. In the sim, Pegasus' ground truth decides instead. Its magnetometer is an ideal Earth field, so only the real drone gives a magnetometer verdict. Each run is saved to `/data/sensor_runs/<time>-<kind>.npz` (+ `.json`) and can be re-analysed offline with `python3 onboard/sensor_analysis.py <run>.npz`. Backed by `sensor_check.py` (the node: live, flight, recording) and `sensor_analysis.py` (numpy only, `tests/test_sensor_analysis.py`). Vibration needs MAVROS' `vibration` plugin: bisg_isaac `MAVROS_PLUGINS=lean+debug`.
 
 ## System Architecture
 
@@ -115,7 +124,7 @@ DRONE_NS=/drone_1 MAV_DEVICE=/dev/ttyTHS1 docker compose -f docker/compose.yaml 
 
 The `onboard` container runs rosbridge (:9090), the ZED map relay and `gcs_control`; MAVROS, brain and barcode start from the dashboard inside it. `DRONE_NS` is the namespace of the ZED / MAVROS topics (empty when they are at `/zed/...` and `/mavros/...`). The ZED wrapper itself is not in the image — it needs the ZED SDK and CUDA.
 
-Without Docker: install `ros-jazzy-mavros ros-jazzy-mavros-extras ros-jazzy-rosbridge-server`, run `sudo /opt/ros/jazzy/lib/mavros/install_geographiclib_datasets.sh` and `pip3 install --break-system-packages opencv-python pyzbar`, then `bash raspberry/start_all.sh --ns /drone_1` (or enable `rosbridge.service`).
+Without Docker: install `ros-jazzy-mavros ros-jazzy-mavros-extras ros-jazzy-rosbridge-server`, run `sudo /opt/ros/jazzy/lib/mavros/install_geographiclib_datasets.sh` and `pip3 install --break-system-packages opencv-python pyzbar`, then `bash onboard/start_all.sh --ns /drone_1` (or enable `rosbridge.service`).
 
 ### Test against the bisg_isaac simulator
 

@@ -10,7 +10,7 @@ new FCU connection — including after a Pixhawk reboot.
 Started alongside MAVROS by mavros_launch.sh. Against a MAVROS that is not ours (the bisg_isaac sim) rosbridge_boot.sh
 starts it with MAVROS_STREAMS=rc in the drone's namespace: PX4 does not stream the motor outputs (SERVO_OUTPUT_RAW ->
 mavros/rc/out, the dashboard's motor knobs) unless asked, and the MAVROS there must load the rc_io plugin
-(bisg_isaac docker/ros/mavros_lean.yaml).
+(bisg_isaac docker/ros/mavros_plugins.yaml).
 
 Environment: MAVROS_STREAMS  all (default: every stream below) | rc (only the motor outputs: the rest is already flowing)
 Names are relative: run with `--ros-args -r __ns:=/drone_1` for a namespaced MAVROS.

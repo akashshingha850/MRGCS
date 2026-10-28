@@ -43,8 +43,14 @@ if [[ -n "${GCS_WEB_PORT:-}" ]]; then
   WEB_PID=$!
 fi
 
+# Sensors tab: live sources, the analyse flight, which source EKF2 should fuse. On sim time against the sim (USE_SIM_TIME=true): its turn rate
+# and hold times are then the drone's, not the slower wall clock's
+echo "[boot] Starting sensor check node (ns ${DRONE_NS:-/}) ..."
+python3 "$SCRIPT_DIR/sensor_check.py" --ros-args ${DRONE_NS:+-r "__ns:=$DRONE_NS"} -p use_sim_time:=${USE_SIM_TIME:-false} &
+SENSORS_PID=$!
+
 # Stop them all when this script exits (systemd stop / reboot / crash)
-trap "kill $BRIDGE_PID $RELAY_PID $WEB_PID $STREAMS_PID $IMG_RELAY_PID 2>/dev/null; wait" EXIT INT TERM
+trap "kill $BRIDGE_PID $RELAY_PID $WEB_PID $STREAMS_PID $IMG_RELAY_PID $SENSORS_PID 2>/dev/null; wait" EXIT INT TERM
 
 # Give rosbridge a moment to bind before the control node tries to publish
 sleep 3

@@ -41,6 +41,8 @@ const S = {
   // onboard services (controlled from dashboard)
   svcStatus: { mavros: 'stopped', brain: 'stopped', barcode: 'stopped' },
   kinetix: null, kinetixTs: 0,   // /gcs/kinetix/status (kinetix_bridge.py)
+  zed: null, zedTs: 0,           // <drone ns>/zed_stack/status (bisg zed-bridge): header badge
+  sensors: null, sensorsTs: 0,   // /gcs/sensors/status (sensor_check.py)
 }
 
 const HIST_MAX = 120   // 120 data points per chart
@@ -421,10 +423,27 @@ function kxRun () {
   const t = Date.now()
   if (t - _kxRunPendingTs >= 800) { _kxRunPendingTs = t; $('kx-msg').textContent = 'click again to start the scan'; return }
   _kxRunPendingTs = 0
-  const explore = $('kx-explore').checked && $('kx-method').value === 'tour'
+  const explore = $('kx-method').value === 'tour'                 // a tour explores the room, then scans it, in one run
   kinetixCmd({ action: 'run', scene: $('kx-scene').value, method: $('kx-method').value,
-               seed: parseInt($('kx-seed').value, 10) || 0, explore })
-  addCmdLog('KINETIX SCAN ' + $('kx-method').value + (explore ? ' (explore first)' : ''), 'SENT')
+               seed: parseInt($('kx-seed').value, 10) || 0, explore, reuse: kxArm() === 'optimized' })
+  addCmdLog('KINETIX SCAN ' + $('kx-method').value + (explore ? ` (explore + scan, ${kxArm()})` : ''), 'SENT')
+}
+
+const kxArm = () => document.querySelector('input[name="kx-arm"]:checked').value
+const KX_ARM_HINT = {
+  optimized:   'Exploration views count as coverage and go to SfM: the tour flies only the gaps.',
+  traditional: 'Exploration only maps the room: the tour scans all of it from scratch.',
+}
+
+// the arm only applies to a tour (explore, then scan); preview the run folder name Kinetix will give the run (RunLog)
+function kxForm () {
+  const explore = $('kx-method').value === 'tour'
+  $('kx-arm-row').style.display = $('kx-arm-hint').style.display = explore ? '' : 'none'
+  $('kx-arm-hint').textContent = KX_ARM_HINT[kxArm()]
+  // shortcut: copies Kinetix's RunLog.run_id naming, update both together
+  const name = `${$('kx-scene').value}_${$('kx-method').value}${explore ? '-explore-' + kxArm() : ''}_mavros_s${parseInt($('kx-seed').value, 10) || 0}`
+  $('kx-save').style.display = $('kx-scene').value && $('kx-method').value ? '' : 'none'   // bridge offline: no lists yet
+  $('kx-save').innerHTML = `saves as <code>&lt;time&gt;_${name.replace(/([_-])/g, '$1<wbr>')}</code>`   // wrap at _ and - only
 }
 
 function kxAbort () {
@@ -432,9 +451,201 @@ function kxAbort () {
   addCmdLog('KINETIX ABORT', 'SENT')
 }
 
+// ── Kinetix reconstruction: kinetix sfm on a run, then its sparse cloud + cameras in the Scan 3D tab ─────────────
+// Cameras are drawn in the cloud, coloured by their error against ground truth (green <= 0.25 m, red >= 1 m); the
+// ground-truth camera centres are white. A camera with few 3D points is weakly held: bundle adjustment can move it far off.
+const KX_WEAK_PTS = 10
+let _kxCloudSub = null, _kxCloud = null
+
+function kxSfm () {
+  const run = $('kx-sfm-run').value
+  if (!run) return
+  kinetixCmd({ action: 'sfm', run })
+  addCmdLog('KINETIX RECONSTRUCT ' + run, 'SENT')
+}
+
+function kxCloud () {
+  const run = $('kx-sfm-run').value
+  if (!run || !ros) return
+  const fresh = !_kxCloudSub || _kxCloudSub.ros !== ros          // a reconnect makes a new connection
+  if (fresh) _kxCloudSub = sub('/gcs/kinetix/cloud', 'std_msgs/String', m => {
+    try { kxCloudLoad(JSON.parse(m.data)) } catch (e) { $('kx-scan-key').textContent = 'bad cloud message: ' + e }
+  }, { queue_length: 1 })
+  $('kx-scan-key').textContent = 'loading ' + run + '…'
+  document.querySelector('.kx-tab[data-pane="kx-pane-scan"]').click()
+  setTimeout(() => kinetixCmd({ action: 'cloud', run }), fresh ? 500 : 0)   // the cloud is sent once: subscribe first
+}
+
+const kxErrRgb = e => e == null ? [0.3, 0.6, 1] : (t => [Math.min(1, 2 * t), Math.min(1, 2 * (1 - t)), 0.1])(Math.max(0, Math.min(1, (e - 0.25) / 0.75)))
+
+function kxCloudLoad (c) {
+  if (c.error) { $('kx-scan-key').textContent = `${c.run}: ${c.error}`; return }
+  _kxCloud = c
+  const cams = c.cams || {}, nP = c.xyz_cm.length / 3, nC = (cams.sfm || []).length, nG = (cams.gt || []).length
+  const n = nP + nC + nG, data = new Float32Array(n * 3), rgb = new Float32Array(n * 3)
+  for (let i = 0; i < nP * 3; i++) data[i] = c.xyz_cm[i] / 100
+  for (let i = 0; i < nP; i++) {
+    const v = c.rgb[i]
+    rgb[i * 3] = (v >> 16 & 255) / 255; rgb[i * 3 + 1] = (v >> 8 & 255) / 255; rgb[i * 3 + 2] = (v & 255) / 255
+  }
+  const put = (k, p, col) => { data.set(p, k * 3); rgb.set(col, k * 3) }
+  ;(cams.sfm || []).forEach((p, i) => put(nP + i, p, kxErrRgb(cams.err_m && cams.err_m[i])))
+  ;(cams.gt || []).forEach((p, i) => put(nP + nC + i, p, [1, 1, 1]))
+  KXSCAN.clearMap(); KXSCAN.refit(); KXSCAN.addScan({ count: n, data, rgb })
+  const err = cams.err_m || []
+  const weak = (cams.points || []).filter(k => k < KX_WEAK_PTS).length
+  $('kx-scan-key').innerHTML = `<b>${c.run}</b><br>${nP.toLocaleString()} of ${c.n_total.toLocaleString()} points · ${nC} cameras` +
+    (err.length ? ` · cam err median ${[...err].sort((a, b) => a - b)[err.length >> 1].toFixed(2)} m, max ${Math.max(...err).toFixed(2)} m` : '') +
+    `<br>cameras: <span style="color:#3ddc84">≤ 0.25 m</span> → <span style="color:#ff4d4d">≥ 1 m</span> off ground truth · ` +
+    `white = ground truth · ${weak} camera(s) with < ${KX_WEAK_PTS} points<br>drag rotate · right-drag pan · wheel zoom`
+  const rows = err.map((e, i) => i).sort((a, b) => err[b] - err[a]).slice(0, 12)
+  $('kx-scan-cams').querySelector('tbody').innerHTML = rows.map(i =>
+    `<tr><td style="font-family:monospace">${cams.idx[i]}${cams.idx[i] >= 900000 ? ' · explore' : ''}</td>` +
+    `<td style="color:rgb(${kxErrRgb(err[i]).map(x => Math.round(x * 255)).join(',')})">${err[i].toFixed(2)}</td>` +
+    `<td>${cams.ekf_err_m ? cams.ekf_err_m[i].toFixed(2) : '—'}</td><td>${cams.points[i]}</td>` +
+    `<td>${cams.points[i] < KX_WEAK_PTS ? '<span style="color:var(--warn)">weakly held</span>' : ''}</td></tr>`).join('')
+}
+
+function drawKxScan () {
+  const cv = $('kx-scan'), pane = $('kx-pane-scan')
+  if (!cv || !pane || pane.style.display === 'none') return
+  const W = cv.clientWidth, H = cv.clientHeight
+  if (W < 2 || H < 2) return
+  if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H }
+  if (KXSCAN.init(cv)) KXSCAN.render(cv)
+}
+
+// Runs tab: select runs and delete their folders (kinetix_bridge `delete`). Two clicks within 0.8 s, like Start.
+const KX_SEL = new Set()
+let _kxDelPendingTs = 0
+
+function kxRunsSel (k) {
+  const runs = k.runs || [], active = k.state !== 'idle' && k.job ? k.job.run : null
+  for (const id of [...KX_SEL]) if (!runs.some(r => r.id === id) || id === active) KX_SEL.delete(id)
+  const gb = runs.filter(r => KX_SEL.has(r.id)).reduce((a, r) => a + (r.size_gb || 0), 0)
+  $('kx-runs-sel').textContent = KX_SEL.size ? `${KX_SEL.size} selected · ${gb.toFixed(1)} GB` : 'none selected'
+  $('btn-kx-del').disabled = !KX_SEL.size
+  const free = runs.filter(r => r.id !== active)
+  $('kx-runs-all').checked = free.length > 0 && free.every(r => KX_SEL.has(r.id))
+  return active
+}
+
+function kxDelete () {
+  const t = Date.now(), n = KX_SEL.size
+  if (!n) return
+  if (t - _kxDelPendingTs >= 800) { _kxDelPendingTs = t; $('kx-msg').textContent = `click Delete again to remove ${n} run(s)`; return }
+  _kxDelPendingTs = 0
+  kinetixCmd({ action: 'delete', runs: [...KX_SEL] })
+  addCmdLog(`KINETIX DELETE ${n} run(s)`, 'SENT')
+  KX_SEL.clear()
+}
+
+function kxSfmInfo (k) {
+  const r = (k.runs || []).find(x => x.id === $('kx-sfm-run').value) || {}, m = r.sfm
+  const busy = k.state !== 'idle'
+  $('btn-kx-sfm').disabled = busy || !r.id
+  $('btn-kx-sfm').textContent = k.state === 'reconstructing' ? 'Reconstructing…' : (m ? 'Reconstruct again' : 'Reconstruct')
+  $('btn-kx-cloud').disabled = !m
+  const row = (a, b) => `<div><b>${a}</b>${b}</div>`, f = (v, d) => v == null ? '—' : v.toFixed(d)
+  $('kx-sfm-info').innerHTML = !m ? (r.id ? 'Not reconstructed yet.' : '—') :
+    row('Registered', `${m.registered} / ${m.frames}`) + row('3D points', (m.points || 0).toLocaleString()) +
+    row('Reprojection', f(m.reproj_px, 2) + ' px') +
+    row('Cam vs GT', `median ${f(m.ate_median_m, 2)} · rmse ${f(m.ate_rmse_m, 2)} · max ${f(m.ate_max_m, 1)} m`) +
+    row('EKF2 vs GT', f(m.ekf2_vs_gt_m, 2) + ' m rms') +
+    row('Completeness', m.completeness != null ? `${(m.completeness * 100).toFixed(0)} % (walls ${(m.walls * 100).toFixed(0)} %)` : '—')
+}
+
 function stopBrainNode () {
   rosPub('/gcs/cmd', 'std_msgs/String', { data: JSON.stringify({ action: 'stop', service: 'brain' }) })
   addCmdLog('STOP brain node (for Kinetix)', 'SENT')
+}
+
+// ── Sensors (sensor_check.py) ─────────────────────────────────────────────────
+// Which source EKF2 should trust: the node flies (or records) and analyses; this shows its live sources, its verdict and the
+// tables it sends as they are (sensor_analysis.py tables(): cells are values or {v, c: ok|warn|bad}).
+let _snCheckPendingTs = 0
+function sensorsCmd (payload, label) {
+  rosPub('/gcs/sensors/cmd', 'std_msgs/String', { data: JSON.stringify(payload) })
+  addCmdLog(label, 'SENT')
+}
+// the analyse run flies the drone: two clicks within 0.8 s, like ARM
+function snCheck () {
+  const t = Date.now()
+  if (t - _snCheckPendingTs >= 800) { _snCheckPendingTs = t; $('sn-msg').textContent = 'click again to take off for the sensor analysis'; return }
+  _snCheckPendingTs = 0
+  sensorsCmd({ action: 'analyse' }, 'SENSOR ANALYSIS (flight)')
+}
+
+const snDeg = r => (r * 180 / Math.PI).toFixed(1) + '°'
+const snYaw = v => `z ${v[2].toFixed(2)} · ${snDeg(v[3])}`
+const snNorm = (v, i) => Math.hypot(v[i], v[i + 1], v[i + 2])
+// [group, stream, label, value(v)] — v = the stream's columns (sensor_analysis.py STREAMS)
+const SN_LIVE = [
+  ['Heading / attitude', 'att', 'FCU attitude', v => { const [x, y, z, w] = v
+    return `${snDeg(Math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y)))} ${snDeg(Math.asin(2 * (w * y - z * x)))} ${snDeg(Math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)))}` }],
+  ['', 'mag', 'Magnetometer', v => (1e6 * snNorm(v, 0)).toFixed(1) + ' µT'],
+  ['', 'zed', 'ZED VIO', snYaw], ['', 'vision', 'Vision → EKF2', snYaw], ['', 'ekf', 'EKF2', snYaw], ['', 'truth', 'Truth (sim)', snYaw],
+  ['Height', 'baro', 'Baro', v => (v[0] / 100).toFixed(2) + ' hPa'],
+  ['', 'range', 'Range (LW20)', v => v[0] == null ? 'invalid' : v[0].toFixed(3) + ' m'],
+  ['Velocity', 'flow', 'Optical flow', v => `q ${v[5]} · ${v[4] ? (Math.hypot(v[0], v[1]) / v[4]).toFixed(2) : '—'} rad/s`],
+  ['', 'ekf_vb', 'EKF2 velocity', v => snNorm(v, 0).toFixed(2) + ' m/s'],
+  ['IMU', 'imu_raw', 'FCU IMU', v => `${snNorm(v, 0).toFixed(2)} m/s² · ${(snNorm(v, 3) * 57.3).toFixed(2)} °/s`],
+  ['', 'zimu', 'ZED IMU', v => `${snNorm(v, 3).toFixed(2)} m/s² · ${(snNorm(v, 0) * 57.3).toFixed(2)} °/s`],
+  ['', 'vib', 'Vibration', v => `acc ${v[2].toFixed(3)} · clip ${v[3] + v[4] + v[5]}`],
+  ['EKF2', 'est', 'Test ratios', v => `v ${(v[0] ?? 0).toFixed(2)} h ${(v[2] ?? 0).toFixed(2)} agl ${(v[4] ?? 0).toFixed(2)}`]
+]
+
+function snCell (c) {
+  if (c && typeof c === 'object') return `<td class="${c.c || ''}">${c.v ?? '—'}</td>`
+  return `<td>${c ?? '—'}</td>`
+}
+function snTable (cols, rows, cls) {
+  return `<table>${cols.length ? `<tr>${cols.map(c => `<th>${c}</th>`).join('')}</tr>` : ''}${rows.map(r =>
+    `<tr${cls ? cls(r) : ''}>${r.map(snCell).join('')}</tr>`).join('')}</table>`
+}
+
+function updateSensorsUI () {
+  const k = S.sensors
+  if (!k) return
+  const busy = ['flying', 'recording'].includes(k.state)
+  $('sn-node').textContent = k.state
+  $('sn-node').className = 'sv ' + (k.state === 'failed' ? 'danger' : busy ? 'warn' : 'ok')
+  $('sn-msg').textContent = (k.step ? `step ${k.step[0]}/${k.step[1]} · ` : '') + (k.samples ? `${k.samples} samples · ` : '') + (k.msg || '—')
+  ;['btn-sn-check', 'btn-sn-record'].forEach(id => { $(id).disabled = busy })
+  $('btn-sn-stop').disabled = !busy
+  $('btn-sn-stop').textContent = k.state === 'recording' ? 'Stop & analyse' : 'Stop · abort → land'
+
+  const lv = k.live || {}
+  $('sn-live').innerHTML = SN_LIVE.map(([grp, key, label, fn]) => {
+    const d = lv[key]
+    if (!d && key === 'truth') return ''
+    const stale = !d || !d.hz
+    let val = '—'
+    try { if (d) val = fn(d.v) } catch (_) {}
+    return (grp ? `<tr><td class="g" colspan="3">${grp}</td></tr>` : '') +
+      `<tr class="${stale ? 'stale' : ''}"><td>${label}</td><td class="hz">${d ? d.hz.toFixed(0) + ' Hz' : 'no data'}</td><td class="v">${val}</td></tr>`
+  }).join('')
+  $('sn-params').innerHTML = Object.entries(k.params || {}).map(([n, v]) =>
+    `<tr><td>${n}</td><td>${typeof v === 'number' && !Number.isInteger(v) ? v.toFixed(4) : v}</td></tr>`).join('') ||
+    '<tr><td>not read yet (mavros/param)</td></tr>'
+
+  const r = k.result
+  let html
+  if (!r) {
+    html = $('sn-result').querySelector('.sn-empty') ? $('sn-result').innerHTML : ''
+  } else if (r.error) {
+    html = `<div class="sn-card"><h3 class="bad">${r.error}</h3></div>`
+  } else {
+    const rec = r.recommend || []
+    const chg = rec.filter(x => x.change)
+    html = `<div class="sn-card"><h3>EKF2 sources for this drone in this room <span class="n">· ${r.kind}, ${r.duration_s} s${r.truth ? ', with sim truth' : ''}${r.saved ? ' · ' + r.saved : ''}</span></h3>
+      <div class="n">${chg.length ? `${chg.length} change${chg.length > 1 ? 's' : ''} suggested (blue). Paste into the QGC MAVLink console, then reboot the FCU (EKF2_MAG_TYPE and EKF2_HGT_REF need it).` : 'The current settings already suit the measured sources.'}</div>
+      ${snTable(['param', 'now', 'suggest', 'why'], rec.map(x => [x.param, x.current, x.suggest, { v: x.why, c: 'why' }]),
+        row => rec.find(x => x.param === row[0]).change ? ' class="chg"' : '')}
+      ${chg.length ? `<pre id="sn-paste">${chg.map(x => `param set ${x.param} ${x.suggest}`).join('\n')}</pre>` : ''}</div>`
+    html += (k.tables || []).map(t => `<div class="sn-card"><h3>${t.title}</h3>${t.note ? `<div class="n">${t.note}</div>` : ''}${snTable(t.cols, t.rows)}</div>`).join('')
+  }
+  if (html && $('sn-result').dataset.h !== html) { $('sn-result').innerHTML = html; $('sn-result').dataset.h = html }
 }
 
 // ── Kinetix live flight ───────────────────────────────────────────────────────
@@ -443,7 +654,7 @@ function stopBrainNode () {
 // blur), height and yaw error against Kinetix's own capture tolerances (published by the bridge as `tol`). Subscribed
 // only while the Kinetix tab is open, so the camera and pose streams cost nothing otherwise.
 const KXL = { subs: [], timer: null, pos: null, yaw: 0, sp: null, spYaw: 0, spTs: 0, vel: 0,
-              hist: [], t0: 0, trail: [], trailDist: 0, gtPos: null, gtTrail: [], gt0: null, ekf0: null, gtErr: null, wasArmed: false, tIn: null, zed: null, metrics: null }
+              hist: [], t0: 0, trail: [], trailDist: 0, gtPos: null, gtTrail: [], gt0: null, ekf0: null, gtErr: null, wasArmed: false, tIn: null, metrics: null }
 const KXL_HIST = 4000                                          // drift samples kept for the whole flight (5 Hz = 13 min); beyond it every 2nd is dropped
 const KXL_TOL  = { pos_m: 0.10, yaw_deg: 3.0, speed_mps: 0.05, settle_s: 1.0 }   // fallback = Kinetix default.yaml
 
@@ -485,11 +696,13 @@ function kxLiveStart () {
     sub(ns + '/local_position/velocity_local', 'geometry_msgs/TwistStamped', m => {
       const v = m.twist.linear; KXL.vel = Math.hypot(v.x ?? 0, v.y ?? 0, v.z ?? 0)
     }, fast),
-    sub(drone + '/zed_stack/status', 'std_msgs/String', m => { try { KXL.zed = JSON.parse(m.data) } catch (_) {} },
-        { throttle_rate: 1000, queue_length: 1 }),
     // chase view: zed_image_relay.py's JPEG of the sim's third-person camera (<drone ns>/gcs/chase/compressed)
     subCamImage(MAP_TOPIC.replace(/\/gcs\/map_cloud$/, '') + '/gcs/chase/compressed', 'kx-cam', null, 0, null,
                 { throttle_rate: 100, queue_length: 1 }),
+    // same feeds as the Image tab
+    subCamImage(ZED_NS + '/left/color/rect/image/compressed', 'kx-rgb', null, 0, null, { throttle_rate: 200, queue_length: 1 }, true),
+    subCamImage(MAP_TOPIC.replace(/\/gcs\/map_cloud$/, '') + '/gcs/depth/compressed', 'kx-depth', null, 0, null, { queue_length: 1 }, true),
+    subCamImage(MAP_TOPIC.replace(/\/gcs\/map_cloud$/, '') + '/gcs/confidence/compressed', 'kx-conf', null, 0, null, { queue_length: 1 }, true),
   ]
   KXL.timer = setInterval(kxLiveTick, 200)
 }
@@ -534,15 +747,8 @@ function kxLiveTick () {
 
 function kxRenderChips (m, tol) {
   const chip = (label, value, cls) => `<span class="kx-chip ${cls || ''}"><b>${label}</b>${value}</span>`
-  const link = S.mode !== '—'
-  const zed = KXL.zed
-  const zedBad = zed && zed.components ? Object.entries(zed.components).filter(([, c]) => c.state !== 'ok').map(([k]) => k) : []
   const flight = S.flightStart ? Math.floor((Date.now() - S.flightStart) / 1000) : null
   const html = [
-    chip('Mode', S.mode, S.mode === 'OFFBOARD' ? 'ok' : (link ? 'warn' : 'danger')),
-    chip('', S.armed ? 'ARMED' : 'DISARMED', S.armed ? 'warn' : ''),
-    chip('FCU', link ? 'connected' : 'no link', link ? 'ok' : 'danger'),
-    chip('ZED', !zed ? '—' : (zed.state === 'ok' ? 'ok' : (zedBad.join(', ') || zed.state)), !zed ? '' : (zed.state === 'ok' ? 'ok' : 'danger')),
     m ? chip('Capture', m.inTol ? `in tolerance · ${Math.min(m.settled, tol.settle_s).toFixed(1)}/${tol.settle_s} s` : 'moving', m.inTol ? 'ok' : 'warn')
       : chip('Capture', 'no setpoint', ''),
     chip('Dist', m ? m.dist.toFixed(2) + ' m' : '—', m ? (m.dist <= tol.pos_m ? 'ok' : 'warn') : ''),
@@ -635,7 +841,7 @@ function updateKinetixUI () {
   $('kx-bridge').textContent = 'online'
   $('kx-bridge').className   = 'sv ok'
   $('kx-state').textContent  = k.state
-  $('kx-state').className    = 'sv ' + ({ flying: 'accent', aborting: 'warn' }[k.state] || '')
+  $('kx-state').className    = 'sv ' + ({ flying: 'accent', reconstructing: 'accent', aborting: 'warn' }[k.state] || '')
   $('kx-run').textContent    = (k.job && k.job.run) || '—'
   $('kx-elapsed').textContent = k.elapsed_s != null
     ? `${Math.floor(k.elapsed_s / 60)}:${String(k.elapsed_s % 60).padStart(2, '0')}` : '—'
@@ -663,9 +869,8 @@ function updateKinetixUI () {
     }
   } else warn.style.display = 'none'
 
-  const tourOnly = $('kx-method').value !== 'tour'                  // exploring first is a tour feature
-  $('kx-explore').disabled = tourOnly || busy
-  if (tourOnly) $('kx-explore').checked = false
+  document.querySelectorAll('input[name="kx-arm"]').forEach(r => { r.disabled = busy })
+  kxForm()
   $('btn-kx-run').disabled   = busy || k.other_setpoint_producers > 0
   $('btn-kx-abort').disabled = !busy || k.state === 'aborting'
 
@@ -675,10 +880,17 @@ function updateKinetixUI () {
   if (atEnd) log.scrollTop = log.scrollHeight
 
   const f = (v, d) => v == null ? '—' : v.toFixed(d)
+  const active = kxRunsSel(k)
   $('kx-runs').querySelector('tbody').innerHTML = (k.runs || []).map(r =>
-    `<tr><td class="id">${r.id}</td><td>${r.method || '—'}</td><td>${r.frames ?? '—'}</td>
+    `<tr><td><input type="checkbox" class="kx-sel" data-id="${r.id}"${KX_SEL.has(r.id) ? ' checked' : ''}${r.id === active ? ' disabled title="running"' : ''}></td>
+      <td class="id">${r.id}</td><td>${f(r.size_gb, 1)}</td><td>${r.method || '—'}</td><td>${r.frames ?? '—'}</td>
       <td>${r.stop || '—'}</td><td>${r.coverage != null ? (r.coverage * 100).toFixed(1) + '%' : '—'}</td>
-      <td>${f(r.travel_m, 1)}</td><td>${f(r.wall_s, 0)}</td></tr>`).join('')
+      <td>${f(r.travel_m, 1)}</td><td>${f(r.wall_s, 0)}</td>
+      <td>${r.sfm ? `${r.sfm.registered}/${r.sfm.frames}` : '—'}</td>
+      <td>${r.sfm ? `${f(r.sfm.ate_median_m, 2)} / ${f(r.sfm.ate_max_m, 1)}` : '—'}</td>
+      <td>${r.sfm && r.sfm.completeness != null ? (r.sfm.completeness * 100).toFixed(0) + '%' : '—'}</td></tr>`).join('')
+  fillSelect($('kx-sfm-run'), (k.runs || []).map(r => r.id))
+  kxSfmInfo(k)
   drawKinetixPlan(k)
 }
 
@@ -762,6 +974,7 @@ function drawKinetixPlan (k, skipInfo) {
     for (let y = Math.ceil(rb[1] / 2) * 2; y <= rb[4]; y += 2) line([[rb[0], y, rb[2]], [rb[3], y, rb[2]]], col('--border'), 1, null, 0.5)
   }
   wire(rb, col('--muted'), []); wire(wb, col('--muted'), [4, 4])
+  if (pl.explored) wire(box(pl.truth_roi), PLAN3D.gt, [2, 4], 1)    // the scene file's room: how far off the fit is
   nf.forEach(b => wire(b, '#e04040', [], 1.5))                     // obstacles Kinetix knows about (fitted from depth, or the scene file's)
 
   line(pl.views, col('--accent'), 1, [3, 3], 0.35)                 // planned order
@@ -800,8 +1013,11 @@ function drawKinetixPlan (k, skipInfo) {
   }
   // legend: each entry drawn in the colour it stands for, right-aligned bottom
   const L = { plan: [`planned (blue)`, col('--accent')], reach: [`reached (green)`, col('--ok')], snap: [`camera snaps (magenta)`, SNAP],
+              room: [`room (grey)`, col('--muted')], fly: [`flight volume (dashed)`, col('--muted')], obst: [`obstacles (red)`, '#e04040'],
+              truth: [`scene-file room (cyan dashed)`, PLAN3D.gt],
               ekf: [`EKF (white)`, PLAN3D.ekf], gt: [`ground truth (cyan)`, PLAN3D.gt], sp: [`setpoint (orange)`, '#f0883e'], hint: [`arrow = yaw · drag to rotate, wheel to zoom`, col('--muted')] }
-  const legend = W < 560 ? [[L.plan, L.reach, L.snap], [L.ekf, L.gt, L.hint]] : [[L.plan, L.reach, L.snap, L.ekf, L.gt, L.sp, L.hint]]
+  const boxes = [L.room, L.fly, ...(nf.length ? [L.obst] : []), ...(pl.explored ? [L.truth] : [])]
+  const legend = W < 560 ? [boxes, [L.plan, L.reach, L.snap], [L.ekf, L.gt, L.hint]] : [boxes, [L.plan, L.reach, L.snap, L.ekf, L.gt, L.sp, L.hint]]
   g.font = '9px monospace'; g.textAlign = 'left'
   legend.forEach((row, i) => {
     const sep = ' · '
@@ -856,7 +1072,31 @@ function initControls () {
     document.querySelectorAll('.kx-pane').forEach(p => { p.style.display = p.id === b.dataset.pane ? '' : 'none' })
   }))
   $('btn-kx-run').addEventListener('click', kxRun)
+  ;['kx-scene', 'kx-method', 'kx-seed'].forEach(id => $(id).addEventListener('input', kxForm))
+  document.querySelectorAll('input[name="kx-arm"]').forEach(r => r.addEventListener('change', kxForm))
+  kxForm()
   $('btn-kx-abort').addEventListener('click', kxAbort)
+  $('btn-kx-sfm').addEventListener('click', kxSfm)
+  $('btn-kx-cloud').addEventListener('click', kxCloud)
+  $('btn-kx-del').addEventListener('click', kxDelete)
+  $('kx-runs').addEventListener('change', e => {                 // the table is redrawn every second: the selection lives in KX_SEL
+    const c = e.target.closest('input.kx-sel')
+    if (!c) return
+    c.checked ? KX_SEL.add(c.dataset.id) : KX_SEL.delete(c.dataset.id)
+    if (S.kinetix) kxRunsSel(S.kinetix)
+  })
+  $('kx-runs-all').addEventListener('change', e => {
+    const k = S.kinetix
+    if (!k) return
+    const active = k.state !== 'idle' && k.job ? k.job.run : null
+    ;(k.runs || []).forEach(r => { if (r.id !== active) e.target.checked ? KX_SEL.add(r.id) : KX_SEL.delete(r.id) })
+    document.querySelectorAll('#kx-runs input.kx-sel').forEach(c => { c.checked = KX_SEL.has(c.dataset.id) })
+    kxRunsSel(k)
+  })
+  $('kx-sfm-run').addEventListener('input', () => S.kinetix && kxSfmInfo(S.kinetix))
+  $('btn-sn-check').addEventListener('click', snCheck)
+  $('btn-sn-record').addEventListener('click', () => sensorsCmd({ action: 'record' }, 'SENSOR RECORD (hand)'))
+  $('btn-sn-stop').addEventListener('click', () => sensorsCmd({ action: 'stop' }, 'SENSOR STOP'))
 
   $('btn-goto').addEventListener('click', cmdGoto)
   $('btn-vel-stop').addEventListener('click', cmdVelStop)
@@ -942,6 +1182,11 @@ function subscribeMavros () {
         subscribeMavros()
       }
     }),
+
+    // ZED stack health (bisg zed-bridge: <drone ns>/zed_stack/status) for the header badge
+    sub(ns.replace(/\/mavros$/, '') + '/zed_stack/status', 'std_msgs/String', m => {
+      try { S.zed = JSON.parse(m.data); S.zedTs = Date.now() } catch (_) {}
+    }, { throttle_rate: 1000, queue_length: 1 }),
 
     // speed + heading + altitude  (VFR_HUD, mavros_extras)
     sub(ns + '/vfr_hud', 'mavros_msgs/VfrHud', m => {
@@ -1109,6 +1354,12 @@ function subscribe () {
     updateKinetixUI()
   })
 
+  // Sensors tab — live sources, analyse flight, EKF2 verdict
+  sub('/gcs/sensors/status', 'std_msgs/String', m => {
+    try { S.sensors = JSON.parse(m.data); S.sensorsTs = Date.now() } catch (_) { return }
+    updateSensorsUI()
+  })
+
   // Brain node — planned path
   sub('/brain/planned_path', 'std_msgs/String', m => {
     try {
@@ -1273,12 +1524,23 @@ function updateDOM () {
     $('kx-bridge').className   = 'sv danger'
     ;['btn-kx-run', 'btn-kx-abort'].forEach(id => { $(id).disabled = true })
   }
+  if (Date.now() - S.sensorsTs > 5000) {                       // sensor_check.py status is 2 Hz
+    $('sn-node').textContent = 'offline'
+    $('sn-node').className   = 'sv danger'
+    document.querySelectorAll('#view-sensors button').forEach(b => { b.disabled = true })
+  }
   // header badges
   const armEl = $('hdr-armed')
   armEl.textContent = S.armed ? 'ARMED' : 'DISARMED'
   armEl.className   = 'hdr-badge' + (S.armed ? ' armed' : '')
   $('hdr-mode').textContent = S.mode
   $('hdr-mode').className   = 'hdr-badge active'
+
+  const zed = Date.now() - (S.zedTs || 0) < 5000 ? S.zed : null       // status is 1 Hz
+  const zedBad = zed && zed.components ? Object.entries(zed.components).filter(([, c]) => c.state !== 'ok').map(([k]) => k) : []
+  $('hdr-zed').textContent = 'ZED ' + (!zed ? '—' : zed.state === 'ok' ? 'OK' : (zedBad.join(', ') || zed.state))
+  $('hdr-zed').className   = 'hdr-badge' + (!zed ? '' : zed.state === 'ok' ? ' ok' : ' armed')
+  $('hdr-zed').title       = zed ? JSON.stringify(zed.components || {}, null, 1).slice(0, 600) : 'no /zed_stack/status'
 
   const fixTxt = S.gps.fix >= 3 ? '3D FIX' : S.gps.fix >= 2 ? '2D FIX' : 'NO GPS'
   const gpsEl  = $('hdr-gps')
@@ -2052,9 +2314,9 @@ function decodePC2xyz (msg) {
   return { data: out, rgb: col, count: n / 3 }
 }
 
-// ── SLAM 3D WebGL point-cloud renderer (ZED spatial map) ─────────────────────
-const SLAM3D = (() => {
-  const MAX = 800000   // ring-buffer capacity (~11 min at 1200 pts/s)
+// ── WebGL point-cloud renderer: the SLAM view's ZED spatial map, the Kinetix tab's reconstruction ─────────────
+// MAX = ring-buffer capacity; sizeK = point size as a share of the canvas height at 1 m depth
+function makeCloud3D (MAX, sizeK) {
   let gl = null, prog = null, bufPos = null, bufCol = null
   let uMVP = -1, uSz = -1, aPos = -1, aCol = -1
   const posArr = new Float32Array(MAX * 3)
@@ -2267,7 +2529,7 @@ const SLAM3D = (() => {
     const used = Math.min(total, MAX)
     if (used === 0) return
     gl.uniformMatrix4fv(uMVP, false, mvpMat(W, H))
-    gl.uniform1f(uSz, 0.15 * H)                    // px = 0.15·H / depth ≈ a 0.17 m voxel on screen: the map reads as a surface, not dust
+    gl.uniform1f(uSz, sizeK * H)                   // SLAM: px = 0.15·H / depth ≈ a 0.17 m voxel on screen: the map reads as a surface, not dust
     gl.bindBuffer(gl.ARRAY_BUFFER, bufPos)
     gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0)
     gl.bindBuffer(gl.ARRAY_BUFFER, bufCol)
@@ -2288,7 +2550,9 @@ const SLAM3D = (() => {
            colors: () => hasRgb ? rgbArr.subarray(0, Math.min(total, MAX) * 3) : null,
            get hasRgb () { return hasRgb }, get mode () { return mode },
            get count () { return Math.min(total, MAX) } }
-})()
+}
+const SLAM3D = makeCloud3D(800000, 0.15)        // ~11 min of ZED map at 1200 pts/s
+const KXSCAN = makeCloud3D(200000, 0.05)        // Kinetix reconstruction: the bridge sends at most 60 k points + the cameras
 
 function drawSLAM () {
   const canvas = $('slam-canvas')
@@ -2380,6 +2644,7 @@ function frame () {
   if (S.activeView === 'slam') {
     drawSLAM()
   }
+  if (S.activeView === 'kinetix') drawKxScan()
 
   requestAnimationFrame(frame)
 }

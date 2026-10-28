@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# start_all.sh — Drone GCS onboard stack in one command (no Docker)
+# start_all.sh — MRGCS onboard stack in one command (no Docker)
 #
 # The camera and the map come from the ZED stack (ZED SDK wrapper), which runs
 # separately; this script starts what the GCS adds on top of it.
@@ -138,7 +138,7 @@ fi
 GCS_IP=$(hostname -I | awk '{print $1}')
 echo ""
 log "══════════════════════════════════════════════════"
-log "  Drone GCS — all systems running"
+log "  MRGCS — all systems running"
 log "  rosbridge  ws://$GCS_IP:9090"
 log "  Logs       $LOG_DIR"
 log "  Processes:"
