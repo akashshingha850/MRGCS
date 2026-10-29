@@ -78,13 +78,13 @@ Backend of the GCS **Kinetix** tab. Runs in the `kinetix:jazzy` image with the K
 
 | Command (`/gcs/kinetix/cmd`) | Runs |
 |---|---|
-| `{"action":"run","scene":"warehouse_room","method":"tour","seed":0}` | `python3 -m kinetix run --scene config/scenes/<scene>.yaml --method <m> --rig mavros --seed <n>` |
-| `{"action":"sfm","run":"<run id>"}` | `python3 -m kinetix sfm runs/<run>` (reconstruct; refused while any job runs, the run must be one of `runs/`) |
+| `{"action":"run","scene":"warehouse_room","method":"tour","seed":0}` | `python3 -m kinetix run --scene kinetix/scenes/<scene>.yaml --method <m> --rig mavros --seed <n>` |
+| `{"action":"sfm","run":"<run id>"}` | `python3 -m kinetix sfm data/<run>` (reconstruct; refused while any job runs, the run must be one of `data/`) |
 | `{"action":"cloud","run":"<run id>"}` | sends that run's reconstruction once on `/gcs/kinetix/cloud` (JSON: `points.ply` in cm with rgb, ≤ 60 k points; every camera's SfM centre in the cloud's frame, ground truth, EKF2, error against ground truth after the Sim3 fit `metrics.json` uses, 3D point count) |
-| `{"action":"delete","runs":["<run id>", ...]}` | removes those `runs/<id>/` folders (ids from the run list only; never the run of a running job) |
+| `{"action":"delete","runs":["<run id>", ...]}` | removes those `data/<id>/` folders and their `results/<id>/` (ids from the run list only; never the run of a running job) |
 | `{"action":"abort"}` | SIGINT to the job = Kinetix's Ctrl+C: fly home at a safe height, AUTO.LAND, disarm (a reconstruction just stops) |
 
-`run` is refused while anything else publishes `<DRONE_NS>/mavros/setpoint_position/local` — Kinetix streams the setpoints itself and only one producer may run per drone. Status (`/gcs/kinetix/status`, 1 Hz JSON): state (`idle`, `flying`, `reconstructing`, `aborting`), job, log tail, scenes, methods, the 40 newest runs with their size on disk, the `run.yaml` summary and, once reconstructed, `sfm/offline/metrics.json`, `plan` (the active or newest run's planned viewpoints from `steps.jsonl`, its flown path from `frames.jsonl` and the scene's room box, all in the scene's map frame), other setpoint producers, last message.
+`run` is refused while anything else publishes `<DRONE_NS>/mavros/setpoint_position/local` — Kinetix streams the setpoints itself and only one producer may run per drone. Status (`/gcs/kinetix/status`, 1 Hz JSON): state (`idle`, `flying`, `reconstructing`, `aborting`), job, log tail, scenes, methods, the 40 newest runs with their size on disk, the `run.yaml` summary and, once reconstructed, `results/<run>/sfm/metrics.json`, `plan` (the active or newest run's planned viewpoints from `steps.jsonl`, its flown path from `frames.jsonl` and the scene's room box, all in the scene's map frame), other setpoint producers, last message.
 
 ---
 

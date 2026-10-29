@@ -6,8 +6,8 @@ Runs inside the kinetix:jazzy image with the Kinetix repo at /kinetix (compose
 service `kinetix-bridge`), and drives Kinetix only through its CLI, one job at
 a time:
 
-  run    python3 -m kinetix run --scene config/scenes/<scene>.yaml --method <m> --rig mavros --seed <n>
-  sfm    python3 -m kinetix sfm runs/<run>   (reconstruct a flown run: <run>/sfm/offline/)
+  run    python3 -m kinetix run --scene kinetix/scenes/<scene>.yaml --method <m> --rig mavros --seed <n>
+  sfm    python3 -m kinetix sfm data/<run>   (reconstruct a flown run: results/<run>/sfm/)
   abort  SIGINT to the running job — for a flight Kinetix's Ctrl+C path: the rig
          flies home at a safe height, lands (AUTO.LAND) and disarms
 
@@ -27,7 +27,7 @@ Subscribes:  /gcs/kinetix/cmd     std_msgs/String  {"action":"run","scene":"ware
                                                    reconstruction); never the run of a job that is running
                                                    {"action":"abort"}
 Publishes:   /gcs/kinetix/status  std_msgs/String  JSON @ 1 Hz: state, job, log tail, scenes, methods, recent runs
-                                                   (run.yaml summary + sfm/offline/metrics.json), tol (Kinetix's capture tolerances), plan (viewpoints +
+                                                   (run.yaml summary + results/<run>/sfm/metrics.json), tol (Kinetix's capture tolerances), plan (viewpoints +
                                                    flown path of the active or newest run, in the scene's map frame), setpoint producers (count and node
                                                    names), last message
              /gcs/kinetix/cloud   std_msgs/String  JSON, on request: the sparse cloud (points.ply, map frame, cm) and every camera:
@@ -63,14 +63,14 @@ N_CLOUD  = 60000        # sparse points sent to the GCS at most (~1.3 MB of JSON
 LABEL    = re.compile(r'x([+-]?[\d.]+)_y([+-]?[\d.]+)_z([+-]?[\d.]+)_h(\d+)')   # Kinetix viewpoint id
 
 try:
-    from kinetix.planner.loop import METHODS            # PYTHONPATH=/kinetix/src in the kinetix image
+    from acquisition.planner.loop import METHODS        # PYTHONPATH=/kinetix in the kinetix image
     METHODS = list(METHODS)
 except Exception:
     METHODS = ['tour', 'roi_coverage']
 
 
 def _tolerances():
-    """Capture tolerances from Kinetix's own config/default.yaml (one source of truth)."""
+    """Capture tolerances from Kinetix's own acquisition/config/default.yaml (one source of truth)."""
     keys = {'pos_m': 'tol_pos_m', 'yaw_deg': 'tol_yaw_deg', 'speed_mps': 'tol_speed_mps', 'settle_s': 'settle_s'}
     def find(node, key):
         if isinstance(node, dict):
@@ -82,7 +82,7 @@ def _tolerances():
                     return r
         return None
     try:
-        cfg = yaml.safe_load((KX / 'config' / 'default.yaml').read_text()) or {}
+        cfg = yaml.safe_load((KX / 'acquisition' / 'config' / 'default.yaml').read_text()) or {}
     except Exception:
         cfg = {}
     return {k: find(cfg, v) for k, v in keys.items()}
@@ -168,7 +168,7 @@ class KinetixBridge(Node):
         if producers:
             return self._say(f'refused: other setpoint producer(s) on {SP_TOPIC}: {", ".join(producers)} '
                              '— stop them first (a stuck Kinetix run? the brain node?)')
-        self._start('run', ['python3', '-m', 'kinetix', 'run', '--scene', f'config/scenes/{scene}.yaml',
+        self._start('run', ['python3', '-m', 'kinetix', 'run', '--scene', f'kinetix/scenes/{scene}.yaml',
                             '--method', method, '--rig', 'mavros', '--seed', str(seed)]
                     + (['--explore'] + ([] if reuse else ['explore.reuse_views=false']) if explore else []),
                     scene=scene, method=method, seed=seed, explore=explore, reuse=reuse)
@@ -179,13 +179,13 @@ class KinetixBridge(Node):
             return self._say(f'refused: a {self._job["kind"]} job is running')
         if run not in {p.name for p in self._run_dirs()}:             # a run id, never a path
             return self._say(f'refused: unknown run "{run}"')
-        if not (KX / 'runs' / run / 'frames.jsonl').exists():
+        if not (KX / 'data' / run / 'frames.jsonl').exists():
             return self._say(f'refused: {run} has no frames to reconstruct')
         try:
-            scene = (yaml.safe_load((KX / 'runs' / run / 'run.yaml').read_text()) or {}).get('scene')
+            scene = (yaml.safe_load((KX / 'data' / run / 'run.yaml').read_text()) or {}).get('scene')
         except Exception:
             scene = None
-        self._start('sfm', ['python3', '-m', 'kinetix', 'sfm', f'runs/{run}'], run=run, scene=scene)
+        self._start('sfm', ['python3', '-m', 'kinetix', 'sfm', f'data/{run}'], run=run, scene=scene)
 
     def _do_delete(self, d):
         ids = d.get('runs')
@@ -203,9 +203,10 @@ class KinetixBridge(Node):
     def _delete(self, ids):
         freed, failed = 0, []
         for r in ids:
-            freed += self._size(KX / 'runs' / r)
+            freed += self._size(KX / 'data' / r)
             try:
-                shutil.rmtree(KX / 'runs' / r)
+                shutil.rmtree(KX / 'data' / r)
+                shutil.rmtree(KX / 'results' / r, ignore_errors=True)  # its reconstructions
             except OSError as e:
                 failed.append(f'{r} ({e.strerror})')
         self._runs_t, self._plan_key = 0.0, None                  # refresh the list and the plan view now
@@ -262,10 +263,10 @@ class KinetixBridge(Node):
 
     # ── runs / scenes ─────────────────────────────────────────────────────────
     def _scenes(self):
-        return sorted(p.stem for p in (KX / 'config' / 'scenes').glob('*.yaml'))
+        return sorted(p.stem for p in (KX / 'kinetix' / 'scenes').glob('*.yaml'))
 
     def _run_dirs(self):
-        d = KX / 'runs'
+        d = KX / 'data'
         return sorted((p for p in d.iterdir() if p.is_dir()), reverse=True) if d.is_dir() else []
 
     def _recent_runs(self):
@@ -275,7 +276,7 @@ class KinetixBridge(Node):
         for p in self._run_dirs()[:N_RUNS]:
             r = {'id': p.name}
             try:
-                key = (p.name, p.stat().st_mtime, (p / 'sfm').stat().st_mtime if (p / 'sfm').exists() else 0)
+                key = (p.name, p.stat().st_mtime, (KX / 'results' / p.name / 'sfm').stat().st_mtime if (KX / 'results' / p.name / 'sfm').exists() else 0)
                 live = self._busy() and self._job and self._job.get('run') == p.name   # still growing below the top level
                 if live or self._sizes.get(p.name, (None,))[0] != key:    # a finished run does not change: walk it once
                     self._sizes[p.name] = (key, self._size(p))
@@ -293,7 +294,7 @@ class KinetixBridge(Node):
             except Exception:
                 pass
             try:
-                m = json.loads((p / 'sfm' / 'offline' / 'metrics.json').read_text())
+                m = json.loads((KX / 'results' / p.name / 'sfm' / 'metrics.json').read_text())
                 gt, cp = m.get('ate_vs_gt') or {}, m.get('completeness_proxy') or {}
                 r['sfm'] = {'registered': m.get('registered'), 'frames': m.get('n_frames'), 'points': m.get('points3D'),
                             'reproj_px': m.get('mean_reproj_error_px'), 'ate_median_m': gt.get('median_m'),
@@ -310,7 +311,7 @@ class KinetixBridge(Node):
         """Room box, workspace and obstacle boxes: the room Kinetix explored in this run if it did, else the scene file's."""
         try:
             fitted = run_dir / 'explore' / 'scene.yaml' if run_dir else None
-            y = yaml.safe_load((fitted if fitted and fitted.exists() else KX / 'config' / 'scenes' / f'{scene}.yaml').read_text()) or {}
+            y = yaml.safe_load((fitted if fitted and fitted.exists() else KX / 'kinetix' / 'scenes' / f'{scene}.yaml').read_text()) or {}
         except Exception:
             return {}
         out = {k: y[k] for k in ('roi', 'workspace') if isinstance(y.get(k), dict)}
@@ -318,7 +319,7 @@ class KinetixBridge(Node):
         out['explored'] = bool(fitted and fitted.exists())
         if out['explored']:                                       # the scene file's room too: the GCS draws how far off the fit is
             try:
-                out['truth_roi'] = (yaml.safe_load((KX / 'config' / 'scenes' / f'{scene}.yaml').read_text()) or {}).get('roi')
+                out['truth_roi'] = (yaml.safe_load((KX / 'kinetix' / 'scenes' / f'{scene}.yaml').read_text()) or {}).get('roi')
             except Exception:
                 pass
         return out
@@ -326,7 +327,7 @@ class KinetixBridge(Node):
     def _plan(self, run_id, scene):
         """Viewpoints Kinetix planned (steps.jsonl) and the path it flew (frames.jsonl), both in the scene's map frame.
         tour plans every viewpoint up front; roi_coverage picks the next best view per step, so its list grows in flight."""
-        d = KX / 'runs' / run_id
+        d = KX / 'data' / run_id
         mt = lambda f: f.stat().st_mtime if f.exists() else 0
         key = (run_id, mt(d / 'steps.jsonl'), mt(d / 'frames.jsonl'), mt(d / 'explore' / 'steps.jsonl'), mt(d / 'explore' / 'scene.yaml'))
         if key == self._plan_key:
@@ -378,11 +379,11 @@ class KinetixBridge(Node):
     def _cloud(self, run):
         import numpy as np
         import pycolmap                                           # the kinetix image has it (kinetix sfm)
-        from kinetix.recon.align import apply, umeyama
+        from kinetix.align import apply, umeyama
         if run not in {p.name for p in self._run_dirs()}:
             raise ValueError(f'unknown run "{run}"')
-        d = KX / 'runs' / run
-        off = d / 'sfm' / 'offline'
+        d = KX / 'data' / run
+        off = KX / 'results' / run / 'sfm'
         if not (off / 'points.ply').exists():
             raise ValueError('not reconstructed yet')
         with open(off / 'points.ply') as f:                      # ascii: x y z r g b, map frame (kinetix sfm aligns it to EKF2)
