@@ -762,7 +762,8 @@ function kxRenderChips (m, tol) {
   if (el && el.dataset.h !== html) { el.innerHTML = html; el.dataset.h = html }
 }
 
-// EKF error against ground truth over the last 30 s, in % of the distance flown: 3D, horizontal and vertical (signed)
+// EKF error against ground truth over the whole flight, in % of the distance flown: 3D, horizontal and vertical, on a log
+// axis (the early-flight % spikes would flatten the rest); vertical is plotted as |z|, its legend value keeps the sign
 function drawKxTrack (tol) {
   const cv = $('kx-track')
   if (!cv) return
@@ -771,18 +772,18 @@ function drawKxTrack (tol) {
   if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr) }
   const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0)
   g.fillStyle = '#0a0e14'; g.fillRect(0, 0, W, H)
-  const series = [['3D err', 'err', '#f0883e'], ['horizontal', 'exy', '#3fb950'], ['vertical (z)', 'ez', '#d2a8ff']]
+  const series = [['3D err', 'err', '#f0883e'], ['horizontal', 'exy', '#3fb950'], ['vertical |z|', 'ez', '#d2a8ff']]
   const pad = { t: 22, b: 18, l: 38, r: 10 }, gW = W - pad.l - pad.r, gH = H - pad.t - pad.b
   const vals = KXL.hist.flatMap(h => [h.err, h.exy, h.ez]), tMax = Math.max(30, KXL.hist.length ? KXL.hist[KXL.hist.length - 1].t : 0)
-  const hi = Math.min(100, Math.max(2, ...vals.map(v => v * 1.1))), lo = Math.min(0, ...vals) * 1.1
-  const Y = v => pad.t + (1 - (v - lo) / (hi - lo)) * gH
+  const pos = vals.map(Math.abs).filter(v => v > 0), hi = Math.min(100, Math.max(1, ...pos))
+  const dHi = Math.ceil(Math.log10(hi)), dLo = Math.min(dHi - 1, Math.floor(Math.log10(Math.max(0.01, Math.min(hi, ...pos)))))   // whole decades, floor 0.01 %
+  const Y = v => pad.t + (1 - (Math.log10(Math.max(Math.abs(v), 10 ** dLo)) - dLo) / (dHi - dLo)) * gH
   g.font = '9px monospace'; g.textAlign = 'right'; g.lineWidth = 1
-  for (let i = 0; i <= 4; i++) {
-    const v = hi - (i / 4) * (hi - lo), y = Y(v)
+  for (let d = dLo; d <= dHi; d++) {
+    const y = Y(10 ** d)
     g.strokeStyle = '#1e2530'; g.beginPath(); g.moveTo(pad.l, y); g.lineTo(W - pad.r, y); g.stroke()
-    g.fillStyle = '#4a5060'; g.fillText(v.toFixed(1) + '%', pad.l - 4, y + 3)
+    g.fillStyle = '#4a5060'; g.fillText((10 ** d).toFixed(Math.max(0, -d)) + '%', pad.l - 4, y + 3)
   }
-  g.strokeStyle = '#4a5060'; g.beginPath(); g.moveTo(pad.l, Y(0)); g.lineTo(W - pad.r, Y(0)); g.stroke()   // zero = EKF on ground truth
   series.forEach(([, key, color]) => {
     g.strokeStyle = color; g.lineWidth = 1.6; g.beginPath(); let pen = false
     KXL.hist.forEach(h => {
@@ -793,9 +794,9 @@ function drawKxTrack (tol) {
   })
   g.textAlign = 'left'; let lx = pad.l
   const now = KXL.hist[KXL.hist.length - 1]
-  series.forEach(([label, key, color]) => { const t = '■ ' + label + (now ? ' ' + now[key].toFixed(1) + '%' : ''); g.fillStyle = color; g.fillText(t, lx, 12); lx += g.measureText(t).width + 12 })
+  series.forEach(([label, key, color]) => { const t = '■ ' + label + (now ? ' ' + now[key].toFixed(2) + '%' : ''); g.fillStyle = color; g.fillText(t, lx, 12); lx += g.measureText(t).width + 12 })
   g.fillStyle = '#4a5060'; g.textAlign = 'right'
-  g.fillText('whole flight · % of distance flown (GT aligned when armed)', W - pad.r, H - 5)
+  g.fillText('whole flight · % of distance flown, log scale (GT aligned when armed)', W - pad.r, H - 5)
   g.textAlign = 'left'; g.fillText(`0 s … ${Math.round(tMax)} s since arming`, pad.l, H - 5)
 }
 
